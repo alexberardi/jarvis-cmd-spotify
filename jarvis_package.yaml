@@ -1,0 +1,97 @@
+schema_version: 1
+name: spotify
+description: Stream Spotify on this node with voice control. Search and play tracks,
+  artists, albums, and playlists; pause, skip, control volume, shuffle, and repeat.
+keywords:
+- spotify
+- music
+- play
+- song
+- album
+- artist
+- playlist
+- shuffle
+- repeat
+- volume
+platforms:
+- darwin
+- linux
+secrets:
+- key: SPOTIFY_CLIENT_ID
+  scope: integration
+  value_type: string
+  required: true
+  description: Spotify Developer App Client ID — create one at developer.spotify.com
+  is_sensitive: false
+  friendly_name: Spotify Client ID
+- key: SPOTIFY_ACCESS_TOKEN
+  scope: integration
+  value_type: string
+  required: false
+  description: OAuth access token (managed automatically)
+  is_sensitive: true
+  friendly_name: Access Token
+- key: SPOTIFY_REFRESH_TOKEN
+  scope: integration
+  value_type: string
+  required: false
+  description: OAuth refresh token (managed automatically)
+  is_sensitive: true
+  friendly_name: Refresh Token
+- key: SPOTIFY_DEVICE_NAME
+  scope: node
+  value_type: string
+  required: false
+  description: 'Name shown for this node in your Spotify app''s Devices list (default:
+    Jarvis)'
+  is_sensitive: false
+  friendly_name: Device Name
+packages:
+- name: httpx
+display_name: Spotify
+author:
+  github: alexberardi
+version: 1.0.0
+min_jarvis_version: 0.9.0
+license: MIT
+categories:
+- media
+- music
+components:
+- type: command
+  name: spotify
+  path: commands/spotify/command.py
+  description: ''
+- type: agent
+  name: spotify_keepalive
+  path: agents/spotify_keepalive/agent.py
+  description: 'Keeps spotifyd running so the Connect device "Jarvis" stays advertised'
+
+setup_guide: |
+  ## One-time setup
+
+  Spotify requires you to register a free developer application — Spotify
+  policy doesn't allow shared client IDs across users. It takes 2 minutes:
+
+  1. Go to [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard)
+  2. Click **Create app**
+     - **App name**: anything (e.g. "Jarvis")
+     - **Redirect URI**: `https://relay.jarvisautomation.io/oauth/bounce`
+     - Tick "Web API"
+  3. Copy the **Client ID** and paste it in **SPOTIFY_CLIENT_ID** above
+  4. Tap **Authenticate with Spotify** to sign in
+
+  ## Pair this node with your Spotify account
+
+  After auth, the node downloads `spotifyd` (a small Spotify Connect daemon)
+  on first use and shows up in your Spotify mobile app as a device named
+  **Jarvis** (or whatever you set in **SPOTIFY_DEVICE_NAME**).
+
+  The first time you say "play something on Spotify", **open the Spotify app
+  on your phone, tap the Devices icon, and select Jarvis**. This pairs the
+  node with your account. After that, voice playback works automatically.
+
+  ## Premium required
+
+  Spotify's playback APIs require a Premium account. Free accounts can use
+  search but not playback control.
