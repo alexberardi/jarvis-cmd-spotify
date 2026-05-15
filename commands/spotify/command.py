@@ -73,6 +73,43 @@ _REPEAT_MAP: dict[str, str] = {
 
 
 _DEVICE_REGISTRATION_TIMEOUT_SECONDS: float = 12.0
+
+
+def _spotify_is_active() -> bool:
+    """True if spotifyd has an active PulseAudio sink-input (= playing audio).
+
+    Ambiguous voice phrases like "stop" / "pause" / "skip" should only route
+    to Spotify when Spotify is the audible player — otherwise they'd hijack
+    commands meant for a different music service (Pandora, etc.). Checking
+    for an active PA sink-input distinguishes "spotifyd is running" (true
+    almost always, since the daemon stays advertising for Connect) from
+    "spotifyd is actually emitting sound right now."
+    """
+    import json as _json
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["pactl", "-f", "json", "list", "sink-inputs"],
+            capture_output=True, text=True, timeout=2.0,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    if result.returncode != 0:
+        return False
+    try:
+        items = _json.loads(result.stdout or "[]")
+    except (ValueError, TypeError):
+        return False
+    for item in items:
+        props = item.get("properties") or {}
+        if props.get("application.process.binary") == "spotifyd":
+            # Sink-input exists. Treat any non-muted, non-corked stream as
+            # "playing." pactl reports `corked: true` for paused streams.
+            if item.get("corked"):
+                continue
+            return True
+    return False
 _DEVICE_REGISTRATION_POLL_SECONDS: float = 1.0
 
 
@@ -90,10 +127,16 @@ class SpotifyCommand(IJarvisCommand):
 
     @property
     def description(self) -> str:
+        # Kept short and parallel to Pandora's description. A longer
+        # description (the prior version mentioned Premium + listed every
+        # feature) destabilized the model's tool-call output formatting
+        # for this command — the LLM emitted the call as XML text inside
+        # the message field instead of populating the tool_calls array,
+        # which the parser doesn't extract from. Pandora has a similar
+        # short description and works first try.
         return (
-            "Stream Spotify on this node. Search and play tracks, artists, "
-            "albums, or playlists; pause, skip, control volume, shuffle, and repeat. "
-            "Requires a Spotify Premium account."
+            "Play music on Spotify. Play tracks, artists, albums, or "
+            "playlists; pause, skip, control volume, shuffle, and repeat."
         )
 
     @property
@@ -263,12 +306,27 @@ class SpotifyCommand(IJarvisCommand):
     def pre_route(self, voice_command: str) -> PreRouteResult | None:
         text: str = voice_command.lower().strip().rstrip(".!?")
 
-        simple_map: dict[str, dict[str, Any]] = {
-            "pause": {"action": "pause"},
+        # Explicit phrases — always claim them, even when Spotify isn't
+        # the active player. "stop spotify" should stop Spotify no matter
+        # what else is playing.
+        explicit_map: dict[str, dict[str, Any]] = {
             "pause spotify": {"action": "pause"},
+            "stop spotify": {"action": "pause"},
+            "play spotify": {"action": "play"},
+            "resume spotify": {"action": "play"},
+        }
+        if text in explicit_map:
+            return PreRouteResult(arguments=explicit_map[text])
+
+        # Ambiguous phrases — "stop", "pause", "skip", "next" could mean
+        # Spotify OR Pandora (or another music service). Only claim them
+        # when Spotify is currently producing audio (spotifyd has an
+        # active PA sink-input). Otherwise return None so the next
+        # command's pre_route (or the LLM) can handle it.
+        ambiguous_map: dict[str, dict[str, Any]] = {
+            "pause": {"action": "pause"},
             "pause music": {"action": "pause"},
             "stop": {"action": "pause"},
-            "stop spotify": {"action": "pause"},
             "stop music": {"action": "pause"},
             "stop the music": {"action": "pause"},
             "skip": {"action": "skip"},
@@ -294,12 +352,12 @@ class SpotifyCommand(IJarvisCommand):
             "what's playing": {"action": "now_playing"},
             "what is playing": {"action": "now_playing"},
             "now playing": {"action": "now_playing"},
-            "play spotify": {"action": "play"},
             "resume": {"action": "play"},
-            "resume spotify": {"action": "play"},
         }
-        if text in simple_map:
-            return PreRouteResult(arguments=simple_map[text])
+        if text in ambiguous_map:
+            if _spotify_is_active():
+                return PreRouteResult(arguments=ambiguous_map[text])
+            return None
 
         # "volume N" / "set volume to N" / "spotify volume N"
         m = re.match(
