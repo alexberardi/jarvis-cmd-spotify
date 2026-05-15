@@ -127,8 +127,18 @@ def _write_config(device_name: str) -> None:
         f'backend = "{backend}"',
         'bitrate = 320',
         'volume_normalisation = true',
+        # initial_volume is mandatory — spotifyd defaults to 0 (silent) on
+        # cold start, which makes Web-API-initiated playback look like the
+        # device is broken: track loads, "play" succeeds, but no audio. 100
+        # is full output and the user can attenuate downstream via PA's
+        # sink volume or the HAT mixer.
+        'initial_volume = 100',
         f'cache_path = "{cache_dir}"',
         'use_mpris = false',
+        # device_type=Speaker tells Spotify Connect to treat this node as a
+        # speaker rather than a generic computer — affects icon and routing
+        # behavior in the user's Spotify app.
+        'device_type = "speaker"',
         '',
     ])
     _config_root().mkdir(parents=True, exist_ok=True)
