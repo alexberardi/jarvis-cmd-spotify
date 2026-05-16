@@ -373,6 +373,13 @@ class SpotifyCommand(IJarvisCommand):
                 return PreRouteResult(arguments={"action": "volume", "level": level})
             return None
 
+        # If the user explicitly named a different music service, don't
+        # pre-route — let that service's pre_route (or the LLM) handle it.
+        # Without this, "play X on pandora" would match the catch-all regex
+        # below with query="X on pandora" and play it on Spotify.
+        if re.search(r"\bon\s+(pandora|apple\s+music|youtube|amazon\s+music|tidal|soundcloud)\b", text):
+            return None
+
         # "play X on spotify" / "play X" -> play with query
         m = re.match(
             r"^(?:play|put on|listen to|start)\s+"
@@ -700,19 +707,67 @@ class SpotifyCommand(IJarvisCommand):
                     context_data={"error": "no_results", "query": query},
                 )
 
-        # Transfer playback to our device, then play
-        _, err = self._call_with_refresh(
-            lambda c: c.transfer_playback(device.id, play=False),
-        )
-        if err:
-            return CommandResponse.error_response(
-                error_details=f"Couldn't switch playback to {device.name}: {err}",
-                context_data={"error": "transfer_failed"},
-            )
-
+        # Spotify's `PUT /me/player/play?device_id=X` activates the device
+        # implicitly when starting playback — no separate `transfer_playback`
+        # step is needed. Calling transfer first actually FAILS with HTTP 500
+        # when the user has no other active Spotify session to transfer FROM
+        # (cold-start: Spotify hasn't been used elsewhere recently). Going
+        # straight to play() side-steps that whole class of failure.
         _, err = self._call_with_refresh(
             lambda c: c.play(device_id=device.id, hit=hit),
         )
+        if err and "Spotify API 5" in err:
+            # Spotify's REST API often returns 5xx (502 "bad gateway", 503)
+            # even when the play command actually reached spotifyd and a
+            # track is loading. Don't trust the HTTP status — poll for up
+            # to ~10s for evidence that spotifyd received the command:
+            #   - Strong signal: uncorked sink-input (= producing audio).
+            #   - Weak signal: any spotifyd sink-input exists (= track is
+            #     loading; audio will start shortly).
+            # Track load + first frames on a Pi Zero 2W can take 4-8s.
+            import json as _json
+            import subprocess
+            import time
+
+            def _spotifyd_has_sink_input() -> bool:
+                try:
+                    r = subprocess.run(
+                        ["pactl", "-f", "json", "list", "sink-inputs"],
+                        capture_output=True, text=True, timeout=2.0,
+                    )
+                except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                    return False
+                if r.returncode != 0:
+                    return False
+                try:
+                    items = _json.loads(r.stdout or "[]")
+                except (ValueError, TypeError):
+                    return False
+                for item in items:
+                    props = item.get("properties") or {}
+                    if props.get("application.process.binary") == "spotifyd":
+                        return True
+                return False
+
+            for i in range(20):  # 20 × 0.5s = 10s max
+                time.sleep(0.5)
+                if _spotify_is_active():
+                    logger.info(
+                        "Spotify play() 5xx but spotifyd is producing audio — treating as success",
+                        error=err, polls=i + 1,
+                    )
+                    err = None
+                    break
+                # After 3s of polling, accept "sink-input exists" as evidence
+                # the command was delivered. Strict uncorked check kept above
+                # for fast-load cases; this catches slow-load cases.
+                if i >= 6 and _spotifyd_has_sink_input():
+                    logger.info(
+                        "Spotify play() 5xx; spotifyd has a sink-input (still loading) — treating as success",
+                        error=err, polls=i + 1,
+                    )
+                    err = None
+                    break
         if err:
             return CommandResponse.error_response(
                 error_details=f"Spotify play failed: {err}",
@@ -732,8 +787,58 @@ class SpotifyCommand(IJarvisCommand):
             context_data={"action": "play", "device": device.name, "message": message},
         )
 
+    def _active_device_id(self) -> str | None:
+        """Return the Jarvis spotifyd Connect device ID, or None if not visible.
+
+        Pause/skip/volume/etc. without a ``device_id`` returns HTTP 502 from
+        Spotify when no other client is currently selected as the active
+        device — even though spotifyd is plainly the one producing audio.
+        Passing the explicit device_id avoids that whole class of failure.
+        """
+        client = self._make_client()
+        if client is None:
+            return None
+        device, _err = self._call_with_refresh(
+            lambda c: c.find_device(self._device_name())
+        )
+        return device.id if device else None
+
     def _handle_pause(self, **_kwargs: Any) -> CommandResponse:
-        _, err = self._call_with_refresh(lambda c: c.pause())
+        device_id = self._active_device_id()
+        _, err = self._call_with_refresh(lambda c: c.pause(device_id=device_id))
+        if err and "Spotify API 5" in err:
+            # Same flaky-Spotify-backend dance as play(): a 5xx response
+            # doesn't mean the pause didn't happen. Poll spotifyd's actual
+            # state — if it's no longer producing audio (corked sink-input
+            # or no sink-input at all), pause succeeded.
+            import time
+            for _ in range(6):  # 6 × 0.5s = 3s max
+                time.sleep(0.5)
+                if not _spotify_is_active():
+                    logger.info(
+                        "Spotify pause() 5xx but spotifyd stopped producing audio — treating as success",
+                        error=err,
+                    )
+                    err = None
+                    break
+        if err:
+            # Last resort: Spotify's Connect WebSocket genuinely failed to
+            # deliver the pause to spotifyd. Bypass it and SIGTERM the
+            # spotifyd process directly — audio stops instantly. Next
+            # play() will restart spotifyd via _ensure_daemon_running.
+            try:
+                from spotify_shared import spotifyd_manager
+                spotifyd_manager.stop()
+                logger.info(
+                    "Spotify pause() failed via API + polling; killed spotifyd locally",
+                    error=err,
+                )
+                err = None
+            except Exception as kill_exc:
+                logger.warning(
+                    "Local spotifyd kill fallback failed",
+                    error=str(kill_exc),
+                )
         if err:
             return CommandResponse.error_response(
                 error_details=f"Pause failed: {err}",
@@ -744,7 +849,8 @@ class SpotifyCommand(IJarvisCommand):
         )
 
     def _handle_skip(self, **_kwargs: Any) -> CommandResponse:
-        _, err = self._call_with_refresh(lambda c: c.next_track())
+        device_id = self._active_device_id()
+        _, err = self._call_with_refresh(lambda c: c.next_track(device_id=device_id))
         if err:
             return CommandResponse.error_response(
                 error_details=f"Skip failed: {err}",
@@ -755,7 +861,8 @@ class SpotifyCommand(IJarvisCommand):
         )
 
     def _handle_previous(self, **_kwargs: Any) -> CommandResponse:
-        _, err = self._call_with_refresh(lambda c: c.previous_track())
+        device_id = self._active_device_id()
+        _, err = self._call_with_refresh(lambda c: c.previous_track(device_id=device_id))
         if err:
             return CommandResponse.error_response(
                 error_details=f"Previous failed: {err}",
@@ -785,7 +892,10 @@ class SpotifyCommand(IJarvisCommand):
                 context_data={"error": "level_out_of_range"},
             )
 
-        _, err = self._call_with_refresh(lambda c: c.set_volume(level))
+        device_id = self._active_device_id()
+        _, err = self._call_with_refresh(
+            lambda c: c.set_volume(level, device_id=device_id)
+        )
         if err:
             return CommandResponse.error_response(
                 error_details=f"Volume change failed: {err}",
@@ -816,7 +926,10 @@ class SpotifyCommand(IJarvisCommand):
                 context_data={"error": "invalid_state"},
             )
 
-        _, err = self._call_with_refresh(lambda c: c.set_shuffle(on))
+        device_id = self._active_device_id()
+        _, err = self._call_with_refresh(
+            lambda c: c.set_shuffle(on, device_id=device_id)
+        )
         if err:
             return CommandResponse.error_response(
                 error_details=f"Shuffle change failed: {err}",
@@ -845,7 +958,10 @@ class SpotifyCommand(IJarvisCommand):
                 context_data={"error": "invalid_state"},
             )
 
-        _, err = self._call_with_refresh(lambda c: c.set_repeat(mode))
+        device_id = self._active_device_id()
+        _, err = self._call_with_refresh(
+            lambda c: c.set_repeat(mode, device_id=device_id)
+        )
         if err:
             return CommandResponse.error_response(
                 error_details=f"Repeat change failed: {err}",
