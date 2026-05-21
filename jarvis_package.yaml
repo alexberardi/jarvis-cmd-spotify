@@ -38,6 +38,13 @@ secrets:
   description: OAuth refresh token (managed automatically)
   is_sensitive: true
   friendly_name: Refresh Token
+- key: SPOTIFY_TOKEN_EXPIRES_AT
+  scope: integration
+  value_type: string
+  required: false
+  description: Epoch seconds when SPOTIFY_ACCESS_TOKEN expires (managed automatically)
+  is_sensitive: false
+  friendly_name: Token Expires At
 - key: SPOTIFY_DEVICE_NAME
   scope: node
   value_type: string
@@ -48,6 +55,12 @@ secrets:
   friendly_name: Device Name
 packages:
 - name: httpx
+apt_packages:
+- raspotify
+apt_sources:
+- name: raspotify
+  key_url: "https://dtcooper.github.io/raspotify/key.asc"
+  repo: "deb https://dtcooper.github.io/raspotify raspotify main"
 display_name: Spotify
 author:
   github: alexberardi
@@ -83,9 +96,8 @@ setup_guide: |
 
   ## Pair this node with your Spotify account
 
-  After auth, the node downloads `spotifyd` (a small Spotify Connect daemon)
-  on first use and shows up in your Spotify mobile app as a device named
-  **Jarvis** (or whatever you set in **SPOTIFY_DEVICE_NAME**).
+  The node shows up in your Spotify mobile app's Devices list as **Jarvis**
+  (or whatever you set in **SPOTIFY_DEVICE_NAME**).
 
   The first time you say "play something on Spotify", **open the Spotify app
   on your phone, tap the Devices icon, and select Jarvis**. This pairs the

@@ -93,35 +93,88 @@ class SpotifyClient:
             "Content-Type": "application/json",
         }
 
+    # 5xx retry policy for Spotify Web API. 502/503 are typically transient
+    # backend hiccups that a single retry recovers from. 504 is a gateway
+    # timeout — Spotify's gateway already waited (and timed out) for its own
+    # backend, so retrying just stacks 10-15s of latency on top with little
+    # chance of success; treat 504 as a hard fail. 2 attempts (not 3) keeps
+    # worst-case wait under ~25s for a fully-broken endpoint.
+    _RETRIABLE_STATUSES: frozenset[int] = frozenset({500, 502, 503})
+    _MAX_ATTEMPTS: int = 2
+    _RETRY_BACKOFF_BASE: float = 0.4  # 0.4s before retry 2
+    _REQUEST_TIMEOUT_SECONDS: float = 8.0
+
     def _request(
         self, method: str, path: str, *,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> Any:
-        url: str = f"{API_BASE}{path}"
-        try:
-            resp = httpx.request(  # type: ignore[union-attr]
-                method, url,
-                headers=self._headers(),
-                params=params,
-                json=json_body,
-                timeout=15.0,
-            )
-        except Exception as e:
-            raise SpotifyAPIError(f"network error: {e}") from e
+        import time as _time
 
-        if resp.status_code == 401:
-            raise SpotifyAuthError("access token rejected (401)")
-        if resp.status_code == 204:
-            return None
-        if not (200 <= resp.status_code < 300):
-            raise SpotifyAPIError(
-                f"Spotify API {resp.status_code}: {resp.text[:200]}"
-            )
-        # Some endpoints return 200 with empty body
-        if not resp.content:
-            return None
-        return resp.json()
+        url: str = f"{API_BASE}{path}"
+        last_5xx_status: int | None = None
+        last_5xx_text: str = ""
+
+        for attempt in range(1, self._MAX_ATTEMPTS + 1):
+            try:
+                resp = httpx.request(  # type: ignore[union-attr]
+                    method, url,
+                    headers=self._headers(),
+                    params=params,
+                    json=json_body,
+                    timeout=self._REQUEST_TIMEOUT_SECONDS,
+                )
+            except Exception as e:
+                # Network errors get the same retry treatment as 5xx — Spotify's
+                # CDN occasionally resets connections.
+                if attempt < self._MAX_ATTEMPTS:
+                    _time.sleep(self._RETRY_BACKOFF_BASE * attempt)
+                    continue
+                raise SpotifyAPIError(f"network error: {e}") from e
+
+            if resp.status_code == 401:
+                raise SpotifyAuthError("access token rejected (401)")
+            if resp.status_code == 204:
+                return None
+            if resp.status_code in self._RETRIABLE_STATUSES:
+                last_5xx_status = resp.status_code
+                last_5xx_text = resp.text[:200]
+                if attempt < self._MAX_ATTEMPTS:
+                    logger.warning(
+                        "Spotify API transient 5xx; retrying",
+                        method=method, path=path, attempt=attempt,
+                        status=resp.status_code,
+                    )
+                    _time.sleep(self._RETRY_BACKOFF_BASE * attempt)
+                    continue
+                # Exhausted: fall through to error raise below
+            if not (200 <= resp.status_code < 300):
+                raise SpotifyAPIError(
+                    f"Spotify API {resp.status_code}: {resp.text[:200]}"
+                )
+            # Endpoints like /pause and /play return 2xx with empty (or
+            # whitespace-only) bodies. Don't trip on those — only attempt
+            # to decode when there's actual content beyond whitespace.
+            body: str = (resp.text or "").strip()
+            if not body:
+                return None
+            try:
+                return resp.json()
+            except ValueError:
+                # 2xx with non-JSON body: treat as success-with-no-payload
+                # rather than raising, so callers like pause()/play() that
+                # don't need a response don't see spurious "failed" errors.
+                logger.warning(
+                    "Spotify 2xx with non-JSON body — treating as success",
+                    method=method, path=path, status=resp.status_code,
+                    body_preview=body[:80],
+                )
+                return None
+
+        # All attempts exhausted with retriable 5xx
+        raise SpotifyAPIError(
+            f"Spotify API {last_5xx_status} after {self._MAX_ATTEMPTS} attempts: {last_5xx_text}"
+        )
 
     # -- User --
 
