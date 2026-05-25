@@ -25,8 +25,9 @@ from typing import Any
 
 # Belt + suspenders: ensure our lib dir is on sys.path so the lazy imports
 # of spotify_shared.* always resolve, even if discovery cache hasn't been
-# refreshed since install.
-_LIB_DIR: str = str(Path.home() / ".jarvis" / "packages" / "spotify" / "lib")
+# refreshed since install. Path matches the Pantry install convention of
+# ~/.jarvis/packages/<name>/<name>_lib/.
+_LIB_DIR: str = str(Path.home() / ".jarvis" / "packages" / "spotify" / "spotify_lib")
 if _LIB_DIR not in sys.path:
     sys.path.insert(0, _LIB_DIR)
 

@@ -23,9 +23,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-# Same belt-and-suspenders as command.py — make sure the package's lib dir is
-# importable regardless of when discovery last refreshed.
-_LIB_DIR: str = str(Path.home() / ".jarvis" / "packages" / "spotify" / "lib")
+# Same belt-and-suspenders as command.py — make sure the package's lib dir
+# is importable regardless of when discovery last refreshed. Matches the
+# Pantry install convention of ~/.jarvis/packages/<name>/<name>_lib/.
+_LIB_DIR: str = str(Path.home() / ".jarvis" / "packages" / "spotify" / "spotify_lib")
 if _LIB_DIR not in sys.path:
     sys.path.insert(0, _LIB_DIR)
 
