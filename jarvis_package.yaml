@@ -59,7 +59,7 @@ display_name: Spotify
 author:
   github: alexberardi
 github_url: https://github.com/alexberardi/jarvis-cmd-spotify
-version: 2.0.1
+version: 2.0.2
 min_jarvis_version: 0.9.0
 license: MIT
 categories:

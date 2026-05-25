@@ -177,6 +177,30 @@ def api_url() -> str:
     return f"http://{API_HOST}:{API_PORT}"
 
 
+def ensure_running_unpaused() -> None:
+    """Send SIGCONT to the go-librespot process if it's been SIGSTOP'd.
+
+    The node's wake-word handler SIGSTOPs go-librespot during voice capture
+    to keep music out of the user's audio (see jarvis-node-setup's
+    ``_pause_active_playback``). The matching SIGCONT runs *after* the
+    command returns — so while our handler is running, the daemon could be
+    paused and its HTTP API frozen with it.
+
+    Calling this at the start of each handler guarantees the daemon is
+    responsive before we hit ``localhost:3678``. SIGCONT is a no-op if the
+    process is already running, so this is cheap in the common case.
+    """
+    pid: int | None = _read_pid()
+    if pid is None or not _process_alive(pid):
+        return
+    try:
+        os.kill(pid, signal.SIGCONT)
+    except (ProcessLookupError, PermissionError):
+        # Race or perm issue — caller's subsequent HTTP call will surface a
+        # real error if the daemon is actually unreachable.
+        pass
+
+
 def stop() -> None:
     """Terminate the go-librespot subprocess, if running."""
     pid: int | None = _read_pid()

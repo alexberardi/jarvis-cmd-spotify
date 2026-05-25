@@ -585,9 +585,16 @@ class SpotifyCommand(IJarvisCommand):
         go_librespot_manager.start(device_name=self._device_name())
 
     def _make_local_client(self) -> Any:
-        """Build a LocalClient pointing at the daemon's HTTP API."""
+        """Build a LocalClient pointing at the daemon's HTTP API.
+
+        Also unpauses the daemon — wake-word ducking SIGSTOPs go-librespot
+        during voice capture, and the matching SIGCONT only runs after the
+        command returns. Without an explicit SIGCONT here, the HTTP request
+        would hit a frozen process and time out.
+        """
         from spotify_shared import go_librespot_manager
         from spotify_shared.local_client import LocalClient
+        go_librespot_manager.ensure_running_unpaused()
         return LocalClient(base_url=go_librespot_manager.api_url())
 
     def _wait_for_ready(self, local_client: Any) -> bool:

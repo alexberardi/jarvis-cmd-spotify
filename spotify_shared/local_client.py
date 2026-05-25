@@ -71,7 +71,13 @@ class LocalStatus:
 class LocalClient:
     """Thin wrapper over go-librespot's REST API."""
 
-    _REQUEST_TIMEOUT_SECONDS: float = 3.0
+    # Fast endpoints (status / volume / shuffle / repeat / pause / resume) get
+    # a short timeout — they're cheap. Track-transition endpoints (play / next
+    # / prev) need a long timeout because the HTTP POST doesn't return until
+    # go-librespot has fetched + decoded the next track, which on a Pi Zero
+    # over the network can legitimately take 5-10s on a cold first track.
+    _FAST_TIMEOUT_SECONDS: float = 3.0
+    _SLOW_TIMEOUT_SECONDS: float = 15.0
 
     def __init__(self, base_url: str) -> None:
         if httpx is None:
@@ -83,12 +89,13 @@ class LocalClient:
     def _request(
         self, method: str, path: str, *,
         json_body: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> Any:
         url: str = f"{self._base}{path}"
         try:
             resp = httpx.request(  # type: ignore[union-attr]
                 method, url, json=json_body,
-                timeout=self._REQUEST_TIMEOUT_SECONDS,
+                timeout=timeout if timeout is not None else self._FAST_TIMEOUT_SECONDS,
             )
         except Exception as e:
             raise LocalAPIUnavailable(f"go-librespot unreachable at {url}: {e}") from e
@@ -150,11 +157,18 @@ class LocalClient:
         ``uri`` can be any context-or-track URI: ``spotify:track:...``,
         ``spotify:album:...``, ``spotify:artist:...``, ``spotify:playlist:...``.
         ``skip_to_uri`` jumps to a specific track inside the context.
+
+        Uses the slow timeout — ``POST /player/play`` blocks until go-librespot
+        has loaded the first track, which on a Pi over the network can take
+        5-10s on a cold start.
         """
         body: dict[str, Any] = {"uri": uri, "paused": False}
         if skip_to_uri:
             body["skip_to_uri"] = skip_to_uri
-        self._request("POST", "/player/play", json_body=body)
+        self._request(
+            "POST", "/player/play",
+            json_body=body, timeout=self._SLOW_TIMEOUT_SECONDS,
+        )
 
     def resume(self) -> None:
         self._request("POST", "/player/resume")
@@ -163,10 +177,17 @@ class LocalClient:
         self._request("POST", "/player/pause")
 
     def next(self) -> None:
-        self._request("POST", "/player/next")
+        # Track-transition: needs the slow timeout, same reasoning as play().
+        self._request(
+            "POST", "/player/next",
+            timeout=self._SLOW_TIMEOUT_SECONDS,
+        )
 
     def prev(self) -> None:
-        self._request("POST", "/player/prev")
+        self._request(
+            "POST", "/player/prev",
+            timeout=self._SLOW_TIMEOUT_SECONDS,
+        )
 
     # -- Volume ------------------------------------------------------------
 
