@@ -1,11 +1,15 @@
-"""Thin wrapper around the Spotify Web API for the operations we need.
+"""Spotify Web API client — search and user-metadata only.
+
+All playback control (play/pause/next/prev/volume/shuffle/repeat) now goes
+through the go-librespot localhost API in ``local_client.py``. Spotify's
+Web API stays in the picture for two read-only jobs: searching the catalog
+to resolve a voice query to a URI, and reading the authenticated user's own
+playlists. Both of those endpoints are reliable; the playback-control
+endpoints were the source of the 5xx pain.
 
 All calls use the user's OAuth access token (Authorization: Bearer ...).
-On 401 the caller should refresh the token via auth.refresh_access_token()
+On 401 the caller should refresh the token via ``auth.refresh_access_token()``
 and retry once.
-
-Only the surface we actually use is implemented — search, play, pause, skip,
-prev, volume, shuffle, repeat, list devices, transfer playback.
 """
 
 from __future__ import annotations
@@ -52,29 +56,11 @@ class SpotifyAPIError(RuntimeError):
 
 
 @dataclass
-class SpotifyDevice:
-    id: str
-    name: str
-    type: str
-    is_active: bool
-    volume_percent: int | None
-
-
-@dataclass
-class CurrentTrack:
-    name: str
-    artists: list[str]
-    album: str
-    uri: str
-    is_playing: bool
-
-
-@dataclass
 class SearchHit:
     """A search result that can be turned into a play request.
 
-    `uri` is the track/album/playlist/artist Spotify URI. `kind` says which.
-    `display` is a human-readable label for the response message.
+    ``uri`` is the track/album/playlist/artist Spotify URI. ``kind`` says
+    which. ``display`` is a human-readable label for the response message.
     """
     uri: str
     kind: str  # "track" | "album" | "playlist" | "artist"
@@ -93,15 +79,13 @@ class SpotifyClient:
             "Content-Type": "application/json",
         }
 
-    # 5xx retry policy for Spotify Web API. 502/503 are typically transient
-    # backend hiccups that a single retry recovers from. 504 is a gateway
-    # timeout — Spotify's gateway already waited (and timed out) for its own
-    # backend, so retrying just stacks 10-15s of latency on top with little
-    # chance of success; treat 504 as a hard fail. 2 attempts (not 3) keeps
-    # worst-case wait under ~25s for a fully-broken endpoint.
+    # 5xx retry policy. Search endpoints rarely hiccup in practice but 502/503
+    # do happen occasionally. 504 = gateway already gave up, retrying just
+    # stacks latency — treat as a hard fail. 2 attempts caps worst-case wait
+    # under ~25s when fully broken.
     _RETRIABLE_STATUSES: frozenset[int] = frozenset({500, 502, 503})
     _MAX_ATTEMPTS: int = 2
-    _RETRY_BACKOFF_BASE: float = 0.4  # 0.4s before retry 2
+    _RETRY_BACKOFF_BASE: float = 0.4
     _REQUEST_TIMEOUT_SECONDS: float = 8.0
 
     def _request(
@@ -125,8 +109,6 @@ class SpotifyClient:
                     timeout=self._REQUEST_TIMEOUT_SECONDS,
                 )
             except Exception as e:
-                # Network errors get the same retry treatment as 5xx — Spotify's
-                # CDN occasionally resets connections.
                 if attempt < self._MAX_ATTEMPTS:
                     _time.sleep(self._RETRY_BACKOFF_BASE * attempt)
                     continue
@@ -147,23 +129,16 @@ class SpotifyClient:
                     )
                     _time.sleep(self._RETRY_BACKOFF_BASE * attempt)
                     continue
-                # Exhausted: fall through to error raise below
             if not (200 <= resp.status_code < 300):
                 raise SpotifyAPIError(
                     f"Spotify API {resp.status_code}: {resp.text[:200]}"
                 )
-            # Endpoints like /pause and /play return 2xx with empty (or
-            # whitespace-only) bodies. Don't trip on those — only attempt
-            # to decode when there's actual content beyond whitespace.
             body: str = (resp.text or "").strip()
             if not body:
                 return None
             try:
                 return resp.json()
             except ValueError:
-                # 2xx with non-JSON body: treat as success-with-no-payload
-                # rather than raising, so callers like pause()/play() that
-                # don't need a response don't see spurious "failed" errors.
                 logger.warning(
                     "Spotify 2xx with non-JSON body — treating as success",
                     method=method, path=path, status=resp.status_code,
@@ -171,7 +146,6 @@ class SpotifyClient:
                 )
                 return None
 
-        # All attempts exhausted with retriable 5xx
         raise SpotifyAPIError(
             f"Spotify API {last_5xx_status} after {self._MAX_ATTEMPTS} attempts: {last_5xx_text}"
         )
@@ -188,8 +162,8 @@ class SpotifyClient:
         """Return the authenticated user's playlists.
 
         Pagination: ``page_size`` items per request, capped at ``max_pages``
-        (default 4 → up to 200 playlists). Spotify's API returns the user's
-        own playlists plus playlists they follow.
+        (default 4 → up to 200 playlists). Spotify returns the user's own
+        playlists plus playlists they follow.
         """
         out: list[dict[str, str]] = []
         path: str | None = f"/me/playlists?limit={page_size}"
@@ -217,8 +191,8 @@ class SpotifyClient:
 
         Resolution: exact match (case-insensitive) → prefix match. Substring
         matching is intentionally skipped because it's too greedy — would
-        match playlists like "Coffee Shop Vibes" when the user wants the song
-        "Coffee".
+        match playlists like "Coffee Shop Vibes" when the user wants the
+        song "Coffee".
         """
         q: str = query.lower().strip()
         if not q:
@@ -235,40 +209,10 @@ class SpotifyClient:
 
         return None
 
-    # -- Devices --
-
-    def list_devices(self) -> list[SpotifyDevice]:
-        data = self._request("GET", "/me/player/devices")
-        if not isinstance(data, dict):
-            return []
-        out: list[SpotifyDevice] = []
-        for d in data.get("devices", []):
-            out.append(SpotifyDevice(
-                id=d.get("id") or "",
-                name=d.get("name") or "",
-                type=d.get("type") or "",
-                is_active=bool(d.get("is_active")),
-                volume_percent=d.get("volume_percent"),
-            ))
-        return out
-
-    def find_device(self, name: str) -> SpotifyDevice | None:
-        target: str = name.lower()
-        for d in self.list_devices():
-            if d.name.lower() == target:
-                return d
-        return None
-
-    def transfer_playback(self, device_id: str, *, play: bool = False) -> None:
-        self._request(
-            "PUT", "/me/player",
-            json_body={"device_ids": [device_id], "play": play},
-        )
-
-    # -- Search --
+    # -- Catalog search --
 
     def search(self, query: str, *, limit: int = 5) -> SearchHit | None:
-        """Search for a query and return the best hit.
+        """Search the Spotify catalog and return the best hit.
 
         Resolution order:
           1. Artist (catalog)
@@ -276,10 +220,10 @@ class SpotifyClient:
           3. Album (catalog)
           4. User's own playlist by name (exact / prefix match)
 
-        Public/editorial playlists are intentionally not searched — they were
-        noisy and rarely what the user wanted. Personal playlists are checked
-        last so that common phrases like "play coffee" still find the song
-        rather than a playlist named "Coffee Shop Vibes".
+        Public/editorial playlists are intentionally not searched — they
+        were noisy and rarely what the user wanted. Personal playlists are
+        checked last so that common phrases like "play coffee" still find
+        the song rather than a playlist named "Coffee Shop Vibes".
         """
         data = self._request(
             "GET", "/search",
@@ -325,85 +269,3 @@ class SpotifyClient:
             return SearchHit(uri=top["uri"], kind="album", display=label)
 
         return self.find_user_playlist(query)
-
-    # -- Playback control --
-
-    def play(self, *, device_id: str | None = None, hit: SearchHit | None = None) -> None:
-        """Start or resume playback.
-
-        With `hit`: starts playing that artist/album/playlist/track.
-        Without `hit`: resumes whatever was playing (or no-op if nothing was).
-        """
-        params: dict[str, Any] = {}
-        if device_id:
-            params["device_id"] = device_id
-
-        body: dict[str, Any] = {}
-        if hit is not None:
-            if hit.kind == "track":
-                body["uris"] = [hit.uri]
-            else:
-                # artist/album/playlist all use context_uri
-                body["context_uri"] = hit.uri
-
-        self._request(
-            "PUT", "/me/player/play",
-            params=params or None,
-            json_body=body or None,
-        )
-
-    def pause(self, *, device_id: str | None = None) -> None:
-        self._request(
-            "PUT", "/me/player/pause",
-            params={"device_id": device_id} if device_id else None,
-        )
-
-    def next_track(self, *, device_id: str | None = None) -> None:
-        self._request(
-            "POST", "/me/player/next",
-            params={"device_id": device_id} if device_id else None,
-        )
-
-    def previous_track(self, *, device_id: str | None = None) -> None:
-        self._request(
-            "POST", "/me/player/previous",
-            params={"device_id": device_id} if device_id else None,
-        )
-
-    def set_volume(self, percent: int, *, device_id: str | None = None) -> None:
-        # Spotify clamps to 0-100 anyway, but be explicit
-        clamped: int = max(0, min(100, percent))
-        params: dict[str, Any] = {"volume_percent": clamped}
-        if device_id:
-            params["device_id"] = device_id
-        self._request("PUT", "/me/player/volume", params=params)
-
-    def set_shuffle(self, on: bool, *, device_id: str | None = None) -> None:
-        params: dict[str, Any] = {"state": "true" if on else "false"}
-        if device_id:
-            params["device_id"] = device_id
-        self._request("PUT", "/me/player/shuffle", params=params)
-
-    def set_repeat(self, mode: str, *, device_id: str | None = None) -> None:
-        """mode: 'off' | 'track' | 'context'."""
-        if mode not in ("off", "track", "context"):
-            raise ValueError(f"invalid repeat mode: {mode}")
-        params: dict[str, Any] = {"state": mode}
-        if device_id:
-            params["device_id"] = device_id
-        self._request("PUT", "/me/player/repeat", params=params)
-
-    def now_playing(self) -> CurrentTrack | None:
-        data = self._request("GET", "/me/player/currently-playing")
-        if not isinstance(data, dict) or "item" not in data:
-            return None
-        item = data.get("item") or {}
-        artists: list[str] = [a.get("name", "") for a in (item.get("artists") or [])]
-        album: str = (item.get("album") or {}).get("name", "")
-        return CurrentTrack(
-            name=item.get("name", ""),
-            artists=artists,
-            album=album,
-            uri=item.get("uri", ""),
-            is_playing=bool(data.get("is_playing")),
-        )

@@ -27,6 +27,17 @@ This is a Jarvis package with the following components:
 - **Shared code**: If you add shared modules, name the directory `spotify_shared/` (not `shared/`, `lib/`, `helpers/` — those collide on sys.path after install)
 - **`context_data["message"]`**: This key is what gets spoken aloud by TTS
 
+## Architectural invariant
+
+**Playback control goes through the local go-librespot HTTP API, not through
+Spotify's Web API.** The Web API is reserved for search and read-only
+metadata. This split is load-bearing — the prior versions of this package
+that drove playback through `PUT /me/player/play`/`/pause`/`/next` etc. paid
+constant 5xx pain because Spotify's Connect API is unreliable for
+non-first-party devices. Don't reintroduce Web API calls for any of:
+`play / pause / next / previous / volume / shuffle / repeat / now_playing`.
+The local API is `localhost:3678` (see `spotify_shared/local_client.py`).
+
 ## Manifest
 
 The `jarvis_package.yaml` declares:

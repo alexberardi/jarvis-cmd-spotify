@@ -4,10 +4,10 @@ Stream Spotify on a Jarvis node with voice control. Search and play tracks,
 artists, albums, or playlists; pause, skip, control volume, shuffle, and
 repeat.
 
-Audio plays locally on the node via [`spotifyd`](https://github.com/Spotifyd/spotifyd) —
+Audio plays locally on the node via [`go-librespot`](https://github.com/devgianlu/go-librespot) —
 the binary auto-installs from upstream releases on first use, so there's
-nothing to install manually. If a Bluetooth speaker is paired with the node,
-playback automatically routes to it (via PulseAudio's `PULSE_SINK`).
+nothing to install manually. If a Bluetooth speaker is paired with the
+node, playback automatically routes to it (via PulseAudio's `PULSE_SINK`).
 
 ## Voice examples
 
@@ -38,17 +38,53 @@ playback automatically routes to it (via PulseAudio's `PULSE_SINK`).
 
 ## Architecture
 
+```
+                       ┌───────────────────────────────────────┐
+                       │ Spotify Web API (api.spotify.com)     │
+                       └─────────────────────▲─────────────────┘
+                                             │ search / metadata only
+                                             │ (read-only, reliable)
+                                             │
+voice ──► command.py ─────────────────────────┤
+                                             │ play / pause / skip /
+                                             │ prev / volume / shuffle /
+                                             │ repeat / now_playing
+                                             ▼
+                       ┌───────────────────────────────────────┐
+                       │ go-librespot (this node, port 3678)   │
+                       │ POST /player/play uri=spotify:track:… │
+                       │ POST /player/pause                    │
+                       │ GET  /status                          │
+                       └─────────────────────┬─────────────────┘
+                                             │ Spotify Connect
+                                             │ (decoded PCM)
+                                             ▼
+                                          PulseAudio → speaker / BT
+```
+
 | File | Purpose |
 |------|---------|
-| `commands/spotify/command.py` | Voice command entry point — pure dispatch, no subprocess/os imports |
-| `spotify_shared/installer.py` | Auto-downloads the right `spotifyd` binary for the platform |
-| `spotify_shared/spotifyd_manager.py` | Launches `spotifyd` as a subprocess with Bluetooth audio routing |
-| `spotify_shared/web_client.py` | Spotify Web API client (search + playback control) |
+| `commands/spotify/command.py` | Voice command entry point — dispatches actions |
+| `spotify_shared/installer.py` | Downloads the right `go-librespot` binary for the platform |
+| `spotify_shared/go_librespot_manager.py` | Owns the daemon's process lifecycle (PID, start/stop/restart) |
+| `spotify_shared/local_client.py` | HTTP client for go-librespot's localhost API (the control path) |
+| `spotify_shared/web_client.py` | Spotify Web API client (search + user playlists) |
 | `spotify_shared/auth.py` | OAuth refresh-token exchange |
+| `agents/spotify_keepalive/agent.py` | Keeps the daemon alive + refreshes OAuth tokens proactively |
 
-`spotifyd` is launched in Zeroconf discovery mode, so the user pairs once
-from their phone's Spotify app. Credentials are then cached in
-`~/.jarvis/spotify/cache/` and re-used on every restart.
+### Why two clients?
+
+Every previous version of this package drove playback through Spotify's
+Web API, which 5xx'd constantly when the target Connect device was our
+own librespot. Cutting Spotify's cloud out of the control path — and only
+hitting it for search/metadata — removed the entire class of "play
+succeeded, audio didn't" failures. Music Assistant does the same thing
+internally; this package borrows that architecture so a self-hosted node
+gets the same reliability without needing MA in the loop.
+
+`go-librespot` is launched in Zeroconf discovery mode, so the user pairs
+once from their phone's Spotify app. Credentials are then cached in
+`~/.jarvis/spotify/go-librespot/` and re-used on every restart.
 
 ## Development
 

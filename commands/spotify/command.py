@@ -1,4 +1,18 @@
-"""Spotify voice command — local playback via librespot, Web API control."""
+"""Spotify voice command — local playback via go-librespot's HTTP API.
+
+Architecture:
+
+  * **Search / metadata** → Spotify Web API (``web_client.py``)
+  * **Play / pause / next / prev / volume / shuffle / repeat / status** →
+    go-librespot's localhost HTTP API (``local_client.py``)
+
+Spotify's Web API used to be the control plane for everything; it 5xx'd
+constantly when the target device was our own librespot, and every action
+needed a workaround (transfer_playback, device_id juggling, sink-input
+polling, SIGTERM-as-pause). Routing playback through the local daemon
+removes all of that — the daemon never hits Spotify's gateway to start or
+stop a track.
+"""
 
 from __future__ import annotations
 
@@ -11,8 +25,7 @@ from typing import Any
 
 # Belt + suspenders: ensure our lib dir is on sys.path so the lazy imports
 # of spotify_shared.* always resolve, even if discovery cache hasn't been
-# refreshed since install. The runtime *should* have already added this via
-# register_package_lib_paths(), but we re-add to be safe — no-op if present.
+# refreshed since install.
 _LIB_DIR: str = str(Path.home() / ".jarvis" / "packages" / "spotify" / "lib")
 if _LIB_DIR not in sys.path:
     sys.path.insert(0, _LIB_DIR)
@@ -73,18 +86,22 @@ _REPEAT_MAP: dict[str, str] = {
 }
 
 
-_DEVICE_REGISTRATION_TIMEOUT_SECONDS: float = 12.0
+# How long to wait for go-librespot to report ``playback_ready`` after start.
+# In the steady state the daemon is already running and ready; this matters
+# only on a cold-start or a daemon restart after BT routing changed.
+_READY_TIMEOUT_SECONDS: float = 12.0
+_READY_POLL_SECONDS: float = 0.5
 
 
 def _spotify_is_active() -> bool:
-    """True if librespot has an active PulseAudio sink-input (= playing audio).
+    """True if go-librespot is producing audio (uncorked PulseAudio sink-input).
 
-    Ambiguous voice phrases like "stop" / "pause" / "skip" should only route
-    to Spotify when Spotify is the audible player — otherwise they'd hijack
-    commands meant for a different music service (Pandora, etc.). Checking
-    for an active PA sink-input distinguishes "librespot is running" (true
-    almost always, since the daemon stays advertising for Connect) from
-    "librespot is actually emitting sound right now."
+    Ambiguous voice phrases like "stop"/"pause"/"skip" should only route to
+    Spotify when Spotify is the audible player — otherwise they'd hijack
+    commands meant for a different music service (Pandora, etc.). The daemon
+    stays running as a Connect advertiser even when idle, so "process exists"
+    is useless; instead, ask PulseAudio whether it's actively pulling samples
+    from a ``go-librespot`` process.
     """
     import json as _json
     import subprocess
@@ -104,14 +121,11 @@ def _spotify_is_active() -> bool:
         return False
     for item in items:
         props = item.get("properties") or {}
-        if props.get("application.process.binary") == "librespot":
-            # Sink-input exists. Treat any non-muted, non-corked stream as
-            # "playing." pactl reports `corked: true` for paused streams.
+        if props.get("application.process.binary") == "go-librespot":
             if item.get("corked"):
                 continue
             return True
     return False
-_DEVICE_REGISTRATION_POLL_SECONDS: float = 1.0
 
 
 class SpotifyCommand(IJarvisCommand):
@@ -132,9 +146,7 @@ class SpotifyCommand(IJarvisCommand):
         # description (the prior version mentioned Premium + listed every
         # feature) destabilized the model's tool-call output formatting
         # for this command — the LLM emitted the call as XML text inside
-        # the message field instead of populating the tool_calls array,
-        # which the parser doesn't extract from. Pandora has a similar
-        # short description and works first try.
+        # the message field instead of populating the tool_calls array.
         return (
             "Play music on Spotify. Play tracks, artists, albums, or "
             "playlists; pause, skip, control volume, shuffle, and repeat."
@@ -274,9 +286,6 @@ class SpotifyCommand(IJarvisCommand):
             supports_pkce=True,
             requires_background_refresh=True,
             refresh_token_secret_key="SPOTIFY_REFRESH_TOKEN",
-            # No native_redirect_uri — use the relay bounce flow. The CC will
-            # set redirect_uri to <JARVIS_RELAY_URL>/oauth/bounce, which is the
-            # URL that needs to be registered in the Spotify Developer Dashboard.
         )
 
     def store_auth_values(self, values: dict[str, str]) -> None:
@@ -290,9 +299,6 @@ class SpotifyCommand(IJarvisCommand):
                 "SPOTIFY_REFRESH_TOKEN", values["refresh_token"],
                 scope="integration",
             )
-        # Persist expiry so the keepalive agent can refresh proactively
-        # instead of waiting for a 401 mid-request. `expires_in` is a
-        # relative offset (seconds from now) per RFC 6749.
         if "expires_in" in values:
             try:
                 expires_at: int = int(_now()) + int(values["expires_in"])
@@ -343,9 +349,7 @@ class SpotifyCommand(IJarvisCommand):
 
         # Ambiguous phrases — "stop", "pause", "skip", "next" could mean
         # Spotify OR Pandora (or another music service). Only claim them
-        # when Spotify is currently producing audio (librespot has an
-        # active PA sink-input). Otherwise return None so the next
-        # command's pre_route (or the LLM) can handle it.
+        # when Spotify is currently producing audio.
         ambiguous_map: dict[str, dict[str, Any]] = {
             "pause": {"action": "pause"},
             "pause music": {"action": "pause"},
@@ -398,8 +402,6 @@ class SpotifyCommand(IJarvisCommand):
 
         # If the user explicitly named a different music service, don't
         # pre-route — let that service's pre_route (or the LLM) handle it.
-        # Without this, "play X on pandora" would match the catch-all regex
-        # below with query="X on pandora" and play it on Spotify.
         if re.search(r"\bon\s+(pandora|apple\s+music|youtube|amazon\s+music|tidal|soundcloud)\b", text):
             return None
 
@@ -419,7 +421,6 @@ class SpotifyCommand(IJarvisCommand):
         return None
 
     def post_process_tool_call(self, args: dict[str, Any], voice_command: str) -> dict[str, Any]:
-        # If the LLM picked 'play' but didn't extract a query, try extracting it
         if args.get("action") == "play" and not args.get("query"):
             stripped: str = re.sub(
                 r"^(?:play|put on|listen to|start)\s+",
@@ -514,7 +515,7 @@ class SpotifyCommand(IJarvisCommand):
             for i, (vc, params) in enumerate(items)
         ]
 
-    # -- Helpers (delegate to spotify_shared/) ------------------------------
+    # -- Helpers -------------------------------------------------------------
 
     def _device_name(self) -> str:
         return self._storage.get_secret("SPOTIFY_DEVICE_NAME", scope="node") or "Jarvis"
@@ -546,12 +547,9 @@ class SpotifyCommand(IJarvisCommand):
         if not new_access:
             return None
         self._storage.set_secret("SPOTIFY_ACCESS_TOKEN", new_access, scope="integration")
-        # Spotify usually rotates the refresh token; persist if rotated
         new_refresh: str | None = data.get("refresh_token")
         if new_refresh and new_refresh != refresh:
             self._storage.set_secret("SPOTIFY_REFRESH_TOKEN", new_refresh, scope="integration")
-        # Track when this new token will expire so the keepalive agent
-        # refreshes ahead of expiry rather than reacting to a 401.
         expires_in: Any = data.get("expires_in")
         if isinstance(expires_in, (int, float)):
             expires_at: int = int(_now()) + int(expires_in)
@@ -566,7 +564,6 @@ class SpotifyCommand(IJarvisCommand):
         cached: str | None = self._storage.get_secret("SPOTIFY_USER_ID", scope="integration")
         if cached:
             return cached
-        # Fetch via /me — needs a valid access token
         result, err = self._call_with_refresh(lambda c: c.me())
         if err or not result:
             return None
@@ -580,30 +577,35 @@ class SpotifyCommand(IJarvisCommand):
         return user_id
 
     def _ensure_daemon_running(self) -> None:
-        """Start librespot. Auth happens via Zeroconf pairing on first run.
+        """Start go-librespot. First call downloads the binary; subsequent
+        calls are idempotent. Pairing happens via Zeroconf — the user
+        selects this node in their phone's Spotify app once."""
+        from spotify_shared import go_librespot_manager
+        go_librespot_manager.start(device_name=self._device_name())
 
-        librespot 0.8.0 (via the apt-installed raspotify package) supports
-        Zeroconf discovery — the user pairs once from their phone's Spotify
-        app, librespot caches credentials, and future launches skip pairing.
+    def _make_local_client(self) -> Any:
+        """Build a LocalClient pointing at the daemon's HTTP API."""
+        from spotify_shared import go_librespot_manager
+        from spotify_shared.local_client import LocalClient
+        return LocalClient(base_url=go_librespot_manager.api_url())
+
+    def _wait_for_ready(self, local_client: Any) -> bool:
+        """Poll the daemon until ``playback_ready: true`` or the deadline.
+
+        ``playback_ready`` flips true once the user has paired the node from
+        their phone's Spotify app and go-librespot has established a session.
+        On every subsequent call after first pairing, this returns true on
+        the first poll because credentials are cached.
         """
-        from spotify_shared import librespot_manager
-        librespot_manager.start(device_name=self._device_name())
-
-    def _wait_for_device(self, client: Any) -> Any | None:
-        """Poll Spotify Web API for our librespot device to register."""
-        from spotify_shared.web_client import SpotifyDevice  # noqa: F401
-
-        target: str = self._device_name().lower()
-        deadline: float = time.monotonic() + _DEVICE_REGISTRATION_TIMEOUT_SECONDS
+        deadline: float = time.monotonic() + _READY_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
-            for d in client.list_devices():
-                if d.name.lower() == target:
-                    return d
-            time.sleep(_DEVICE_REGISTRATION_POLL_SECONDS)
-        return None
+            if local_client.is_ready():
+                return True
+            time.sleep(_READY_POLL_SECONDS)
+        return False
 
     def _make_client(self) -> Any | None:
-        """Build a SpotifyClient with a valid access token, refreshing if needed."""
+        """Build a SpotifyClient (Web API, for search/metadata) with a valid token."""
         from spotify_shared.web_client import SpotifyClient
 
         token: str | None = self._access_token()
@@ -614,10 +616,7 @@ class SpotifyCommand(IJarvisCommand):
         return SpotifyClient(access_token=token)
 
     def _call_with_refresh(self, fn: Any) -> tuple[Any, str | None]:
-        """Run a closure against the API, refreshing the token once on 401.
-
-        Returns (result, error_message). On success, error_message is None.
-        """
+        """Run a closure against the Web API, refreshing the token once on 401."""
         from spotify_shared.web_client import SpotifyAuthError, SpotifyAPIError, SpotifyClient
 
         client = self._make_client()
@@ -650,7 +649,6 @@ class SpotifyCommand(IJarvisCommand):
                 context_data={"error": "missing_action"},
             )
 
-        # Quick check: does the user have OAuth set up at all?
         if not self._access_token() and not self._refresh_token():
             return CommandResponse.error_response(
                 error_details=(
@@ -681,207 +679,99 @@ class SpotifyCommand(IJarvisCommand):
     # -- Handlers ------------------------------------------------------------
 
     def _handle_play(self, **kwargs: Any) -> CommandResponse:
-        from spotify_shared import librespot_manager
-        from spotify_shared.librespot_manager import LibrespotMissingError
+        from spotify_shared import go_librespot_manager
+        from spotify_shared.go_librespot_manager import GoLibrespotMissingError
+        from spotify_shared.local_client import LocalAPIError, LocalAPIUnavailable
         query: str | None = kwargs.get("query")
 
-        # Make sure librespot is running so the node shows up as a Connect
-        # device. start() is idempotent — no-op if already running.
         try:
             self._ensure_daemon_running()
-        except LibrespotMissingError:
+        except GoLibrespotMissingError as e:
             return CommandResponse.error_response(
                 error_details=(
-                    "Spotify daemon isn't installed. Re-run install.sh on "
-                    "the node, or `sudo apt install raspotify` manually."
+                    f"Spotify daemon isn't available: {e}. Re-install the Spotify "
+                    f"package from the Pantry."
                 ),
-                context_data={"error": "librespot_not_installed"},
+                context_data={"error": "daemon_missing"},
             )
         except Exception as e:
-            logger.error("librespot start failed", error=str(e))
+            logger.error("go-librespot start failed", error=str(e))
             return CommandResponse.error_response(
                 error_details=f"Couldn't start the Spotify daemon: {e}",
                 context_data={"error": "daemon_start_failed"},
             )
 
-        # Find our device. If it's not yet registered, wait briefly.
-        client = self._make_client()
-        if client is None:
-            return CommandResponse.error_response(
-                error_details="Spotify authentication failed. Re-authenticate from Jarvis settings.",
-                context_data={"error": "auth_failed"},
-            )
-
-        device = self._wait_for_device(client)
-        if device is None:
-            paired: bool = librespot_manager.status(self._device_name()).paired
+        local = self._make_local_client()
+        if not self._wait_for_ready(local):
+            paired: bool = go_librespot_manager.status(self._device_name()).paired
             if not paired:
                 return CommandResponse.error_response(
                     error_details=(
-                        f"Open Spotify on your phone, tap the Devices icon, and select "
-                        f"'{self._device_name()}' to pair this node."
+                        f"Open Spotify on your phone, tap the Devices icon, and "
+                        f"select '{self._device_name()}' to pair this node."
                     ),
                     context_data={"error": "not_paired", "device_name": self._device_name()},
                 )
             return CommandResponse.error_response(
-                error_details=(
-                    f"The Spotify daemon didn't register as a Connect device. "
-                    f"Try saying 'play' again."
-                ),
-                context_data={"error": "device_not_registered"},
+                error_details="The Spotify daemon didn't come up in time. Try again.",
+                context_data={"error": "daemon_not_ready"},
             )
 
-        # Search for the requested content (if any)
-        hit = None
-        if query:
-            search_result, err = self._call_with_refresh(lambda c: c.search(query))
-            if err:
+        # Resume path: no query → just resume whatever was last playing.
+        if not query:
+            try:
+                local.resume()
+            except (LocalAPIError, LocalAPIUnavailable) as e:
                 return CommandResponse.error_response(
-                    error_details=f"Spotify search failed: {err}",
-                    context_data={"error": "search_failed", "query": query},
+                    error_details=f"Couldn't resume Spotify: {e}",
+                    context_data={"error": "resume_failed"},
                 )
-            hit = search_result
-            if hit is None:
-                return CommandResponse.error_response(
-                    error_details=f"I couldn't find anything on Spotify for '{query}'.",
-                    context_data={"error": "no_results", "query": query},
-                )
+            return CommandResponse.success_response(
+                context_data={"action": "play", "message": "Resumed Spotify"},
+            )
 
-        # Spotify's `PUT /me/player/play?device_id=X` activates the device
-        # implicitly when starting playback — no separate `transfer_playback`
-        # step is needed. Calling transfer first actually FAILS with HTTP 500
-        # when the user has no other active Spotify session to transfer FROM
-        # (cold-start: Spotify hasn't been used elsewhere recently). Going
-        # straight to play() side-steps that whole class of failure.
-        _, err = self._call_with_refresh(
-            lambda c: c.play(device_id=device.id, hit=hit),
-        )
-        if err and "Spotify API 5" in err:
-            # Spotify's REST API often returns 5xx (502 "bad gateway", 503)
-            # even when the play command actually reached librespot and a
-            # track is loading. Don't trust the HTTP status — poll for up
-            # to ~10s for evidence that librespot received the command:
-            #   - Strong signal: uncorked sink-input (= producing audio).
-            #   - Weak signal: any librespot sink-input exists (= track is
-            #     loading; audio will start shortly).
-            # Track load + first frames on a Pi Zero 2W can take 4-8s.
-            import json as _json
-            import subprocess
-            import time
-
-            def _librespot_has_sink_input() -> bool:
-                try:
-                    r = subprocess.run(
-                        ["pactl", "-f", "json", "list", "sink-inputs"],
-                        capture_output=True, text=True, timeout=2.0,
-                    )
-                except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                    return False
-                if r.returncode != 0:
-                    return False
-                try:
-                    items = _json.loads(r.stdout or "[]")
-                except (ValueError, TypeError):
-                    return False
-                for item in items:
-                    props = item.get("properties") or {}
-                    if props.get("application.process.binary") == "librespot":
-                        return True
-                return False
-
-            for i in range(20):  # 20 × 0.5s = 10s max
-                time.sleep(0.5)
-                if _spotify_is_active():
-                    logger.info(
-                        "Spotify play() 5xx but librespot is producing audio — treating as success",
-                        error=err, polls=i + 1,
-                    )
-                    err = None
-                    break
-                # After 3s of polling, accept "sink-input exists" as evidence
-                # the command was delivered. Strict uncorked check kept above
-                # for fast-load cases; this catches slow-load cases.
-                if i >= 6 and _librespot_has_sink_input():
-                    logger.info(
-                        "Spotify play() 5xx; librespot has a sink-input (still loading) — treating as success",
-                        error=err, polls=i + 1,
-                    )
-                    err = None
-                    break
+        # Play-with-query path: resolve via Web API search, then play the
+        # returned URI through the local daemon.
+        search_result, err = self._call_with_refresh(lambda c: c.search(query))
         if err:
             return CommandResponse.error_response(
-                error_details=f"Spotify play failed: {err}",
+                error_details=f"Spotify search failed: {err}",
+                context_data={"error": "search_failed", "query": query},
+            )
+        hit = search_result
+        if hit is None:
+            return CommandResponse.error_response(
+                error_details=f"I couldn't find anything on Spotify for '{query}'.",
+                context_data={"error": "no_results", "query": query},
+            )
+
+        try:
+            local.play(uri=hit.uri)
+        except (LocalAPIError, LocalAPIUnavailable) as e:
+            return CommandResponse.error_response(
+                error_details=f"Spotify play failed: {e}",
                 context_data={"error": "play_failed"},
             )
 
-        if hit is not None:
-            kind_label: str = {
-                "track": "track", "album": "album",
-                "playlist": "playlist", "artist": "music by",
-            }.get(hit.kind, hit.kind)
-            message: str = f"Playing {kind_label} {hit.display} on Spotify"
-        else:
-            message = "Resumed Spotify"
+        kind_label: str = {
+            "track": "track", "album": "album",
+            "playlist": "playlist", "artist": "music by",
+        }.get(hit.kind, hit.kind)
+        message: str = f"Playing {kind_label} {hit.display} on Spotify"
 
         return CommandResponse.success_response(
-            context_data={"action": "play", "device": device.name, "message": message},
+            context_data={"action": "play", "message": message},
         )
-
-    def _active_device_id(self) -> str | None:
-        """Return the Jarvis librespot Connect device ID, or None if not visible.
-
-        Pause/skip/volume/etc. without a ``device_id`` returns HTTP 502 from
-        Spotify when no other client is currently selected as the active
-        device — even though librespot is plainly the one producing audio.
-        Passing the explicit device_id avoids that whole class of failure.
-        """
-        client = self._make_client()
-        if client is None:
-            return None
-        device, _err = self._call_with_refresh(
-            lambda c: c.find_device(self._device_name())
-        )
-        return device.id if device else None
 
     def _handle_pause(self, **_kwargs: Any) -> CommandResponse:
-        device_id = self._active_device_id()
-        _, err = self._call_with_refresh(lambda c: c.pause(device_id=device_id))
-        if err and "Spotify API 5" in err:
-            # Same flaky-Spotify-backend dance as play(): a 5xx response
-            # doesn't mean the pause didn't happen. Poll librespot's actual
-            # state — if it's no longer producing audio (corked sink-input
-            # or no sink-input at all), pause succeeded.
-            import time
-            for _ in range(6):  # 6 × 0.5s = 3s max
-                time.sleep(0.5)
-                if not _spotify_is_active():
-                    logger.info(
-                        "Spotify pause() 5xx but librespot stopped producing audio — treating as success",
-                        error=err,
-                    )
-                    err = None
-                    break
-        if err:
-            # Last resort: Spotify's Connect WebSocket genuinely failed to
-            # deliver the pause to librespot. Bypass it and SIGTERM the
-            # librespot process directly — audio stops instantly. Next
-            # play() will restart librespot via _ensure_daemon_running.
-            try:
-                from spotify_shared import librespot_manager
-                librespot_manager.stop()
-                logger.info(
-                    "Spotify pause() failed via API + polling; killed librespot locally",
-                    error=err,
-                )
-                err = None
-            except Exception as kill_exc:
-                logger.warning(
-                    "Local librespot kill fallback failed",
-                    error=str(kill_exc),
-                )
-        if err:
+        from spotify_shared.local_client import LocalAPIError, LocalAPIUnavailable
+
+        local = self._make_local_client()
+        try:
+            local.pause()
+        except (LocalAPIError, LocalAPIUnavailable) as e:
             return CommandResponse.error_response(
-                error_details=f"Pause failed: {err}",
+                error_details=f"Pause failed: {e}",
                 context_data={"error": "pause_failed"},
             )
         return CommandResponse.success_response(
@@ -889,11 +779,14 @@ class SpotifyCommand(IJarvisCommand):
         )
 
     def _handle_skip(self, **_kwargs: Any) -> CommandResponse:
-        device_id = self._active_device_id()
-        _, err = self._call_with_refresh(lambda c: c.next_track(device_id=device_id))
-        if err:
+        from spotify_shared.local_client import LocalAPIError, LocalAPIUnavailable
+
+        local = self._make_local_client()
+        try:
+            local.next()
+        except (LocalAPIError, LocalAPIUnavailable) as e:
             return CommandResponse.error_response(
-                error_details=f"Skip failed: {err}",
+                error_details=f"Skip failed: {e}",
                 context_data={"error": "skip_failed"},
             )
         return CommandResponse.success_response(
@@ -901,11 +794,14 @@ class SpotifyCommand(IJarvisCommand):
         )
 
     def _handle_previous(self, **_kwargs: Any) -> CommandResponse:
-        device_id = self._active_device_id()
-        _, err = self._call_with_refresh(lambda c: c.previous_track(device_id=device_id))
-        if err:
+        from spotify_shared.local_client import LocalAPIError, LocalAPIUnavailable
+
+        local = self._make_local_client()
+        try:
+            local.prev()
+        except (LocalAPIError, LocalAPIUnavailable) as e:
             return CommandResponse.error_response(
-                error_details=f"Previous failed: {err}",
+                error_details=f"Previous failed: {e}",
                 context_data={"error": "previous_failed"},
             )
         return CommandResponse.success_response(
@@ -913,6 +809,8 @@ class SpotifyCommand(IJarvisCommand):
         )
 
     def _handle_volume(self, **kwargs: Any) -> CommandResponse:
+        from spotify_shared.local_client import LocalAPIError, LocalAPIUnavailable
+
         level_raw: Any = kwargs.get("level")
         if level_raw is None:
             return CommandResponse.error_response(
@@ -932,13 +830,12 @@ class SpotifyCommand(IJarvisCommand):
                 context_data={"error": "level_out_of_range"},
             )
 
-        device_id = self._active_device_id()
-        _, err = self._call_with_refresh(
-            lambda c: c.set_volume(level, device_id=device_id)
-        )
-        if err:
+        local = self._make_local_client()
+        try:
+            local.set_volume(level)
+        except (LocalAPIError, LocalAPIUnavailable) as e:
             return CommandResponse.error_response(
-                error_details=f"Volume change failed: {err}",
+                error_details=f"Volume change failed: {e}",
                 context_data={"error": "volume_failed"},
             )
         return CommandResponse.success_response(
@@ -949,6 +846,8 @@ class SpotifyCommand(IJarvisCommand):
         )
 
     def _handle_shuffle(self, **kwargs: Any) -> CommandResponse:
+        from spotify_shared.local_client import LocalAPIError, LocalAPIUnavailable
+
         state_raw: Any = kwargs.get("state")
         if state_raw is None:
             return CommandResponse.error_response(
@@ -966,13 +865,12 @@ class SpotifyCommand(IJarvisCommand):
                 context_data={"error": "invalid_state"},
             )
 
-        device_id = self._active_device_id()
-        _, err = self._call_with_refresh(
-            lambda c: c.set_shuffle(on, device_id=device_id)
-        )
-        if err:
+        local = self._make_local_client()
+        try:
+            local.set_shuffle(on)
+        except (LocalAPIError, LocalAPIUnavailable) as e:
             return CommandResponse.error_response(
-                error_details=f"Shuffle change failed: {err}",
+                error_details=f"Shuffle change failed: {e}",
                 context_data={"error": "shuffle_failed"},
             )
         return CommandResponse.success_response(
@@ -983,6 +881,8 @@ class SpotifyCommand(IJarvisCommand):
         )
 
     def _handle_repeat(self, **kwargs: Any) -> CommandResponse:
+        from spotify_shared.local_client import LocalAPIError, LocalAPIUnavailable
+
         state_raw: Any = kwargs.get("state")
         if state_raw is None:
             return CommandResponse.error_response(
@@ -998,13 +898,12 @@ class SpotifyCommand(IJarvisCommand):
                 context_data={"error": "invalid_state"},
             )
 
-        device_id = self._active_device_id()
-        _, err = self._call_with_refresh(
-            lambda c: c.set_repeat(mode, device_id=device_id)
-        )
-        if err:
+        local = self._make_local_client()
+        try:
+            local.set_repeat(mode)
+        except (LocalAPIError, LocalAPIUnavailable) as e:
             return CommandResponse.error_response(
-                error_details=f"Repeat change failed: {err}",
+                error_details=f"Repeat change failed: {e}",
                 context_data={"error": "repeat_failed"},
             )
         spoken: str = {"off": "off", "track": "this track", "context": "the playlist"}[mode]
@@ -1016,25 +915,29 @@ class SpotifyCommand(IJarvisCommand):
         )
 
     def _handle_now_playing(self, **_kwargs: Any) -> CommandResponse:
-        result, err = self._call_with_refresh(lambda c: c.now_playing())
-        if err:
+        from spotify_shared.local_client import LocalAPIError, LocalAPIUnavailable
+
+        local = self._make_local_client()
+        try:
+            st = local.status()
+        except (LocalAPIError, LocalAPIUnavailable) as e:
             return CommandResponse.error_response(
-                error_details=f"Couldn't read what's playing: {err}",
+                error_details=f"Couldn't read what's playing: {e}",
                 context_data={"error": "now_playing_failed"},
             )
-        if result is None:
+        if st.stopped or not st.track_uri:
             return CommandResponse.error_response(
                 error_details="Nothing is playing on Spotify right now.",
                 context_data={"error": "nothing_playing"},
             )
-        artists: str = ", ".join(result.artists) if result.artists else "unknown artist"
+        artists: str = ", ".join(st.track_artists) if st.track_artists else "unknown artist"
         return CommandResponse.success_response(
             context_data={
                 "action": "now_playing",
-                "song": result.name,
-                "artists": result.artists,
-                "album": result.album,
-                "is_playing": result.is_playing,
-                "message": f"{result.name} by {artists} from the album {result.album}",
+                "song": st.track_name,
+                "artists": st.track_artists,
+                "album": st.track_album,
+                "is_playing": not st.paused,
+                "message": f"{st.track_name} by {artists} from the album {st.track_album}",
             },
         )

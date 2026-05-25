@@ -2,20 +2,18 @@
 
 Runs on startup and every few minutes. Responsibilities:
 
-  1. **Daemon keepalive** — start ``librespot`` (from the apt-installed
-     ``raspotify`` package) if it isn't running; restart it when the audio
-     sink target changes (BT speaker connect/disconnect) so PULSE_SINK
-     takes effect.
-  2. **OAuth token refresh** — exchange the refresh token for a fresh
-     access token ahead of expiry, so the next voice command doesn't pay
-     a 401 round-trip. The command's own ``_call_with_refresh`` is the
-     fallback; this is the proactive path.
+  1. **Daemon keepalive** — start ``go-librespot`` if it isn't running, and
+     restart it when the audio sink target changes (BT speaker connect /
+     disconnect) so the new ``PULSE_SINK`` env takes effect. The binary
+     itself auto-installs on first start (see ``spotify_shared/installer.py``).
+  2. **OAuth token refresh** — exchange the refresh token for a fresh access
+     token ahead of expiry, so the next voice command doesn't pay a 401
+     round-trip. The command's own ``_call_with_refresh`` is the fallback;
+     this is the proactive path.
 
-The agent uses the apt-installed ``librespot`` binary at ``/usr/bin/librespot``
-(installed by the ``raspotify`` apt package, which the node baseline
-install.sh sets up). If the binary is missing, the keepalive step is
-skipped and logged — token refresh still runs so re-pairing later "just
-works."
+If go-librespot can't be downloaded (offline first-boot, unsupported arch),
+the keepalive step is skipped and logged — token refresh still runs so
+pairing later "just works."
 """
 
 from __future__ import annotations
@@ -69,7 +67,7 @@ _REFRESH_LEAD_SECONDS: int = 600
 
 
 class SpotifyKeepaliveAgent(IJarvisAgent):
-    """Keep librespot alive + refresh OAuth tokens ahead of expiry."""
+    """Keep go-librespot alive + refresh OAuth tokens ahead of expiry."""
 
     def __init__(self) -> None:
         self._storage = JarvisStorage("spotify")
@@ -88,14 +86,13 @@ class SpotifyKeepaliveAgent(IJarvisAgent):
 
     @property
     def schedule(self) -> AgentSchedule:
-        # Run on startup, then check every 5 minutes. librespot is robust and
-        # rarely dies; the cadence also drives proactive token refresh
+        # Run on startup, then check every 5 minutes. go-librespot is robust
+        # and rarely dies; the cadence also drives proactive token refresh
         # (tokens last 3600s, refresh window is 600s ahead of expiry).
         return AgentSchedule(interval_seconds=300, run_on_startup=True)
 
     @property
     def required_secrets(self) -> list[IJarvisSecret]:
-        # Use the same SPOTIFY_DEVICE_NAME that the command uses (per-node).
         return [
             JarvisSecret(
                 "SPOTIFY_DEVICE_NAME",
@@ -107,7 +104,7 @@ class SpotifyKeepaliveAgent(IJarvisAgent):
         ]
 
     async def run(self) -> None:
-        """One tick: refresh tokens if needed, then keepalive librespot."""
+        """One tick: refresh tokens if needed, then keepalive go-librespot."""
         refreshed: bool = self._maybe_refresh_token()
         await self._keepalive_daemon()
         self._last_status["token_refreshed_this_tick"] = refreshed
@@ -128,8 +125,6 @@ class SpotifyKeepaliveAgent(IJarvisAgent):
             "SPOTIFY_CLIENT_ID", scope="integration",
         )
         if not refresh_token or not client_id:
-            # Either OAuth was never completed or client ID isn't configured.
-            # Nothing to refresh — the command will surface a re-auth prompt.
             return False
 
         expires_at_raw: str | None = self._storage.get_secret(
@@ -141,8 +136,6 @@ class SpotifyKeepaliveAgent(IJarvisAgent):
             expires_at = 0
 
         now: int = int(time.time())
-        # No expiry recorded → refresh immediately so future ticks have a
-        # baseline. Otherwise only refresh when we're inside the lead window.
         if expires_at and (expires_at - now) > _REFRESH_LEAD_SECONDS:
             return False
 
@@ -191,20 +184,20 @@ class SpotifyKeepaliveAgent(IJarvisAgent):
     # -- Daemon keepalive ----------------------------------------------------
 
     async def _keepalive_daemon(self) -> None:
-        """Ensure librespot is running with current BT routing.
+        """Ensure go-librespot is running with current BT routing.
 
         Idempotent in the steady state, but if the audio sink target
         changed since last tick (BT speaker connected/disconnected),
-        restart librespot so the new PULSE_SINK env takes effect — the
-        env is captured at process start, and the daemon doesn't
+        restart go-librespot so the new ``PULSE_SINK`` env takes effect —
+        the env is captured at process start, and the daemon doesn't
         re-read it during its lifetime.
 
-        If librespot isn't installed yet (raspotify apt package missing),
-        logs once per tick and returns cleanly — token refresh has
+        If the binary can't be downloaded (offline first-boot, unsupported
+        arch), logs once per tick and returns cleanly — token refresh has
         already run.
         """
-        from spotify_shared import librespot_manager
-        from spotify_shared.librespot_manager import LibrespotMissingError
+        from spotify_shared import go_librespot_manager
+        from spotify_shared.go_librespot_manager import GoLibrespotMissingError
 
         try:
             from jarvis_command_sdk import BluetoothAudio
@@ -222,29 +215,30 @@ class SpotifyKeepaliveAgent(IJarvisAgent):
         try:
             if sink_changed and was_running:
                 logger.info(
-                    "Audio sink changed; restarting librespot to pick up new routing",
+                    "Audio sink changed; restarting go-librespot to pick up new routing",
                     from_sink=last_sink, to_sink=current_sink,
                 )
-                pid: int = librespot_manager.restart(device_name=device_name)
+                pid: int = go_librespot_manager.restart(device_name=device_name)
             else:
-                pid = librespot_manager.start(device_name=device_name)
-        except LibrespotMissingError:
+                pid = go_librespot_manager.start(device_name=device_name)
+        except GoLibrespotMissingError as e:
             logger.warning(
-                "librespot binary not installed; re-run install.sh or "
-                "`sudo apt install raspotify` on the node.",
+                "go-librespot binary not available; pairing will fail until "
+                "the binary can be downloaded.",
+                error=str(e),
             )
             self._last_status = {
                 "running": False,
-                "error": "librespot_not_installed",
+                "error": "go_librespot_not_installed",
                 "audio_sink": current_sink,
             }
             return
         except Exception as e:
-            logger.error("librespot keepalive: start/restart failed", error=str(e))
+            logger.error("go-librespot keepalive: start/restart failed", error=str(e))
             self._last_status = {"running": False, "error": str(e)}
             return
 
-        st = librespot_manager.status(device_name)
+        st = go_librespot_manager.status(device_name)
         self._last_status = {
             "running": st.running,
             "paired": st.paired,
@@ -252,7 +246,7 @@ class SpotifyKeepaliveAgent(IJarvisAgent):
             "pid": pid,
             "audio_sink": current_sink,
         }
-        logger.info("librespot keepalive tick", **self._last_status)
+        logger.info("go-librespot keepalive tick", **self._last_status)
 
     def get_context_data(self) -> dict[str, Any]:
         # No need to inject Spotify state into voice prompt — the command

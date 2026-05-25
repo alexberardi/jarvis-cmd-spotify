@@ -55,16 +55,11 @@ secrets:
   friendly_name: Device Name
 packages:
 - name: httpx
-apt_packages:
-- raspotify
-apt_sources:
-- name: raspotify
-  key_url: "https://dtcooper.github.io/raspotify/key.asc"
-  repo: "deb https://dtcooper.github.io/raspotify raspotify main"
 display_name: Spotify
 author:
   github: alexberardi
-version: 1.0.0
+github_url: https://github.com/alexberardi/jarvis-cmd-spotify
+version: 2.0.0
 min_jarvis_version: 0.9.0
 license: MIT
 categories:
@@ -78,7 +73,8 @@ components:
 - type: agent
   name: spotify_keepalive
   path: agents/spotify_keepalive/agent.py
-  description: 'Keeps spotifyd running so the Connect device "Jarvis" stays advertised'
+  description: 'Keeps go-librespot running so the Connect device "Jarvis" stays advertised
+    and refreshes OAuth tokens ahead of expiry'
 
 setup_guide: |
   ## One-time setup
@@ -102,6 +98,18 @@ setup_guide: |
   The first time you say "play something on Spotify", **open the Spotify app
   on your phone, tap the Devices icon, and select Jarvis**. This pairs the
   node with your account. After that, voice playback works automatically.
+
+  ## How playback works
+
+  Playback runs locally on the node via **go-librespot**, a small open-source
+  Spotify Connect daemon. The binary auto-downloads on first use — no manual
+  install needed.
+
+  All voice actions (play, pause, skip, volume, etc.) are dispatched directly
+  to the local daemon over its built-in localhost API. Spotify's cloud is
+  consulted only for search and metadata. The setup is intentionally similar
+  to what Music Assistant does internally, and it sidesteps the flakiness of
+  Spotify's Connect/Web APIs for non-first-party devices.
 
   ## Premium required
 
