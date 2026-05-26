@@ -207,7 +207,7 @@ class SpotifyKeepaliveAgent(IJarvisAgent):
             current_sink = None
 
         device_name: str = (
-            self._storage.get_secret("SPOTIFY_DEVICE_NAME", scope="node") or "Jarvis"
+            self._storage.get_secret("SPOTIFY_DEVICE_NAME", scope="integration") or "Jarvis"
         )
         last_sink = self._last_status.get("audio_sink")
         was_running: bool = bool(self._last_status.get("running"))

@@ -244,7 +244,7 @@ class SpotifyCommand(IJarvisCommand):
             JarvisSecret(
                 "SPOTIFY_DEVICE_NAME",
                 "Name shown for this node in your Spotify app's Devices list (default: Jarvis)",
-                "node", "string",
+                "integration", "string",
                 is_sensitive=False, required=False,
                 friendly_name="Device Name",
             ),
@@ -519,7 +519,7 @@ class SpotifyCommand(IJarvisCommand):
     # -- Helpers -------------------------------------------------------------
 
     def _device_name(self) -> str:
-        return self._storage.get_secret("SPOTIFY_DEVICE_NAME", scope="node") or "Jarvis"
+        return self._storage.get_secret("SPOTIFY_DEVICE_NAME", scope="integration") or "Jarvis"
 
     def _client_id(self) -> str | None:
         return self._storage.get_secret("SPOTIFY_CLIENT_ID", scope="integration")

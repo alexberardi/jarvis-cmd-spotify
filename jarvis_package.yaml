@@ -46,7 +46,7 @@ secrets:
   is_sensitive: false
   friendly_name: Token Expires At
 - key: SPOTIFY_DEVICE_NAME
-  scope: node
+  scope: integration
   value_type: string
   required: false
   description: 'Name shown for this node in your Spotify app''s Devices list (default:
