@@ -371,11 +371,14 @@ class SpotifyClient:
         """Search the Spotify catalog and return the best hit.
 
         Resolution order:
-          1. User's own playlist by **exact** name match, when the query is
-             multi-word (≥ 2 tokens). High-confidence signal that the user
-             named their own playlist; single-word queries skip this step
-             because "play coffee" should still find the song, not a
-             "Coffee" playlist.
+          1. For multi-word queries (≥ 2 tokens): user's own playlist by
+             exact → prefix → fuzzy match. Voice queries like "play feel
+             good acoustic" are almost always the user naming their own
+             playlist — Spotify's catalog match for the same phrase
+             (e.g. artist "Acoustic Heartstrings") is rarely what they
+             meant. Single-word queries skip this step because "play
+             coffee" should find the song, not a "Coffee Shop Vibes"
+             playlist.
           2. Artist (catalog)
           3. Track (catalog)
           4. Album (catalog)
@@ -386,13 +389,13 @@ class SpotifyClient:
         """
         q_low: str = query.lower().strip()
 
-        # Step 1: multi-word exact playlist match.
+        # Step 1: multi-word playlist promotion (exact / prefix / fuzzy).
         if len(q_low.split()) >= 2:
-            for p in self._cached_user_playlists():
-                if p["name"].lower() == q_low:
-                    return SearchHit(
-                        uri=p["uri"], kind="playlist", display=p["name"],
-                    )
+            playlist_hit: SearchHit | None = self.find_user_playlist(
+                query, allow_substring=True,
+            )
+            if playlist_hit is not None:
+                return playlist_hit
 
         # Steps 2-4: catalog.
         data = self._request(

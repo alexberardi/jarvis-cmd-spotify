@@ -230,6 +230,54 @@ def test_multi_word_no_exact_playlist_falls_to_catalog(client: SpotifyClient) ->
     assert hit.kind == "track"
 
 
+def test_search_promotes_multi_word_prefix_playlist_over_catalog(client: SpotifyClient) -> None:
+    """Multi-word query with playlist prefix match beats catalog artist."""
+    playlists = [
+        {"name": "Feel Good Acoustic Vibes", "uri": "spotify:playlist:fga", "id": "fga"},
+    ]
+    catalog = {
+        "artists": {"items": [{"uri": "spotify:artist:a", "name": "Acoustic Heartstrings"}]},
+        "tracks": {"items": []},
+        "albums": {"items": []},
+    }
+    with patch.object(client, "_request", return_value=catalog), \
+         patch.object(client, "list_user_playlists", return_value=playlists):
+        hit = client.search("feel good acoustic")
+    assert hit is not None
+    assert hit.kind == "playlist"
+    assert hit.uri == "spotify:playlist:fga"
+
+
+def test_search_promotes_multi_word_fuzzy_playlist_over_catalog(client: SpotifyClient) -> None:
+    """Multi-word fuzzy playlist match (STT slip) beats catalog artist."""
+    playlists = [
+        {"name": "Jungle Night", "uri": "spotify:playlist:jn", "id": "jn"},
+    ]
+    catalog = {
+        "artists": {"items": [{"uri": "spotify:artist:a", "name": "Knight Riders"}]},
+        "tracks": {"items": []},
+        "albums": {"items": []},
+    }
+    with patch.object(client, "_request", return_value=catalog), \
+         patch.object(client, "list_user_playlists", return_value=playlists):
+        hit = client.search("jungle knight")
+    assert hit is not None
+    assert hit.kind == "playlist"
+    assert hit.uri == "spotify:playlist:jn"
+
+
+def test_search_single_word_still_catalog_first(client: SpotifyClient) -> None:
+    """Promotion is multi-word only — 'play coffee' still finds the song."""
+    playlists = [
+        {"name": "Coffee Shop Vibes", "uri": "spotify:playlist:c", "id": "c"},
+    ]
+    with patch.object(client, "_request", return_value=_catalog_track("Coffee", "Sylvan Esso")), \
+         patch.object(client, "list_user_playlists", return_value=playlists):
+        hit = client.search("coffee")
+    assert hit is not None
+    assert hit.kind == "track"
+
+
 def test_no_catalog_no_playlist_returns_none(client: SpotifyClient) -> None:
     with patch.object(client, "_request", return_value=_empty_catalog()), \
          patch.object(client, "list_user_playlists", return_value=[]):
