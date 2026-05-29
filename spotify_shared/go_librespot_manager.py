@@ -19,6 +19,7 @@ is unchanged.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -324,13 +325,28 @@ def reset_pairing() -> None:
 
 
 def has_cached_credentials() -> bool:
-    """Whether go-librespot has post-pairing credentials cached.
+    """Whether go-librespot has non-empty post-pairing credentials cached.
 
-    go-librespot writes ``state.json`` to its ``--config_dir`` after the
-    user pairs from their phone's Spotify app. Presence of that file =
-    pairing already happened and future launches skip the discovery step.
+    go-librespot writes ``state.json`` to its ``--config_dir`` on startup
+    even before pairing, so the file's existence alone is a false signal.
+    The actual pairing fills in ``credentials.data`` (the encrypted blob)
+    and ``credentials.username`` — we treat the credentials as present
+    only when both look populated. With an empty stub state.json the
+    daemon advertises itself via zeroconf but has no session, and voice
+    commands need to surface the "pair on your phone" error rather than
+    the misleading "daemon didn't come up in time."
     """
-    return _credentials_path().is_file()
+    path = _credentials_path()
+    if not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    creds = data.get("credentials") if isinstance(data, dict) else None
+    if not isinstance(creds, dict):
+        return False
+    return bool(creds.get("username")) and bool(creds.get("data"))
 
 
 def daemon_log_tail(lines: int = 20) -> str:
