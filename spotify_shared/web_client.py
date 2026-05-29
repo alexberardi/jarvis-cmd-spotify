@@ -175,6 +175,14 @@ class SpotifyClient:
 
     # -- User playlists --
 
+    # Class-level cache so each per-call `SpotifyClient` instance still
+    # benefits — we make a new client on every voice command, but the user's
+    # playlist list rarely changes mid-session. Keyed by bearer token so a
+    # token refresh invalidates the entry naturally.
+    _playlists_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
+    _PLAYLISTS_CACHE_TTL_SECONDS: float = 60.0
+    _PLAYLISTS_CACHE_MAX_TOKENS: int = 4
+
     def list_user_playlists(self, *, max_pages: int = 4, page_size: int = 50) -> list[dict[str, str]]:
         """Return the authenticated user's playlists.
 
@@ -203,18 +211,42 @@ class SpotifyClient:
                 path = None
         return out
 
-    def find_user_playlist(self, query: str) -> SearchHit | None:
+    def _cached_user_playlists(self) -> list[dict[str, str]]:
+        import time as _time
+        now: float = _time.monotonic()
+        entry = self._playlists_cache.get(self._token)
+        if entry and entry[0] + self._PLAYLISTS_CACHE_TTL_SECONDS > now:
+            return entry[1]
+        playlists: list[dict[str, str]] = self.list_user_playlists()
+        self._playlists_cache[self._token] = (now, playlists)
+        # Cap the cache so rotated tokens don't accumulate. Drop the oldest
+        # non-current entry if we're over the limit.
+        if len(self._playlists_cache) > self._PLAYLISTS_CACHE_MAX_TOKENS:
+            oldest: str = min(
+                (k for k in self._playlists_cache if k != self._token),
+                key=lambda k: self._playlists_cache[k][0],
+                default="",
+            )
+            if oldest:
+                del self._playlists_cache[oldest]
+        return playlists
+
+    def find_user_playlist(
+        self, query: str, *, allow_substring: bool = False,
+    ) -> SearchHit | None:
         """Match a query against the user's own playlists by name.
 
-        Resolution: exact match (case-insensitive) → prefix match. Substring
-        matching is intentionally skipped because it's too greedy — would
-        match playlists like "Coffee Shop Vibes" when the user wants the
-        song "Coffee".
+        Resolution order: exact (case-insensitive) → prefix → substring.
+        Substring matching runs only when ``allow_substring=True``; the
+        caller signals this when voice phrasing makes playlist intent
+        explicit (e.g. "play my X playlist"). Without that signal we stop
+        at prefix to avoid playlists like "Coffee Shop Vibes" hijacking
+        the song "Coffee".
         """
         q: str = query.lower().strip()
         if not q:
             return None
-        playlists: list[dict[str, str]] = self.list_user_playlists()
+        playlists: list[dict[str, str]] = self._cached_user_playlists()
 
         for p in playlists:
             if p["name"].lower() == q:
@@ -224,6 +256,11 @@ class SpotifyClient:
             if p["name"].lower().startswith(q):
                 return SearchHit(uri=p["uri"], kind="playlist", display=p["name"])
 
+        if allow_substring:
+            for p in playlists:
+                if q in p["name"].lower():
+                    return SearchHit(uri=p["uri"], kind="playlist", display=p["name"])
+
         return None
 
     # -- Catalog search --
@@ -232,16 +269,30 @@ class SpotifyClient:
         """Search the Spotify catalog and return the best hit.
 
         Resolution order:
-          1. Artist (catalog)
-          2. Track (catalog)
-          3. Album (catalog)
-          4. User's own playlist by name (exact / prefix match)
+          1. User's own playlist by **exact** name match, when the query is
+             multi-word (≥ 2 tokens). High-confidence signal that the user
+             named their own playlist; single-word queries skip this step
+             because "play coffee" should still find the song, not a
+             "Coffee" playlist.
+          2. Artist (catalog)
+          3. Track (catalog)
+          4. Album (catalog)
+          5. User's own playlist by prefix match (last-resort fallback)
 
         Public/editorial playlists are intentionally not searched — they
-        were noisy and rarely what the user wanted. Personal playlists are
-        checked last so that common phrases like "play coffee" still find
-        the song rather than a playlist named "Coffee Shop Vibes".
+        were noisy and rarely what the user wanted.
         """
+        q_low: str = query.lower().strip()
+
+        # Step 1: multi-word exact playlist match.
+        if len(q_low.split()) >= 2:
+            for p in self._cached_user_playlists():
+                if p["name"].lower() == q_low:
+                    return SearchHit(
+                        uri=p["uri"], kind="playlist", display=p["name"],
+                    )
+
+        # Steps 2-4: catalog.
         data = self._request(
             "GET", "/search",
             params={
@@ -251,7 +302,7 @@ class SpotifyClient:
             },
         )
         if not isinstance(data, dict):
-            return None
+            return self.find_user_playlist(query)
 
         artists = (data.get("artists") or {}).get("items") or []
         if artists:
@@ -285,4 +336,5 @@ class SpotifyClient:
                 label = f"{label} by {artist_name}"
             return SearchHit(uri=top["uri"], kind="album", display=label)
 
+        # Step 5: prefix fallback.
         return self.find_user_playlist(query)

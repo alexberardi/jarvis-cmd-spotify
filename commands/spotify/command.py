@@ -94,6 +94,48 @@ _READY_TIMEOUT_SECONDS: float = 12.0
 _READY_POLL_SECONDS: float = 0.5
 
 
+def _detect_playlist_intent(voice_command: str, query: str) -> tuple[str, str]:
+    """Classify how strongly the voice phrase signals "I want a playlist".
+
+    Returns ``(intent, cleaned_query)`` where ``intent`` is:
+
+      - ``"strong"`` — the literal word "playlist" appears. Use playlist-only
+        search with substring matching allowed; don't fall back to catalog
+        because the user explicitly said playlist.
+      - ``"soft"``   — phrase starts with "play my X" (no "playlist" word).
+        Try playlists first (substring allowed); fall back to catalog if no
+        playlist matches. Covers "play my Discover Weekly".
+      - ``"none"``   — no playlist signal. Existing catalog-first search;
+        multi-word exact playlist matches still promote at the ``search()``
+        layer downstream.
+
+    ``cleaned_query`` strips leading ``my ``/``the ``/``playlist `` and the
+    trailing `` playlist`` so the remaining text is just the playlist name
+    candidate. If cleaning leaves nothing (e.g. "play my playlist") we drop
+    back to ``"none"`` so the resume path runs.
+    """
+    vc: str = voice_command.lower().strip().rstrip(".!?")
+
+    has_playlist_word: bool = bool(re.search(r"\bplaylist\b", vc))
+    has_my_prefix: bool = bool(re.search(
+        r"^(?:play|put on|listen to|start)\s+my\s+\S", vc,
+    ))
+
+    if not has_playlist_word and not has_my_prefix:
+        return "none", query
+
+    cleaned: str = query.strip()
+    cleaned = re.sub(r"^(?:my|the)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^playlist\b\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+playlist$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip()
+
+    if not cleaned or cleaned.lower() == "playlist":
+        return "none", query
+
+    return ("strong" if has_playlist_word else "soft"), cleaned
+
+
 def _spotify_is_active() -> bool:
     """True if go-librespot is producing audio (uncorked PulseAudio sink-input).
 
@@ -319,6 +361,8 @@ class SpotifyCommand(IJarvisCommand):
     def rules(self) -> list[str]:
         return [
             "If user says 'play [X] on Spotify' or 'play [X]' (after Spotify context), use action='play' with query='[X]'.",
+            "If user says 'play my [X] playlist' or 'play the [X] playlist', use action='play' with query='[X]' (drop 'my'/'the' and 'playlist' — just the name).",
+            "If user says 'play my [X]' without 'playlist', use action='play' with query='[X]' (drop 'my' — covers user playlists like 'play my Discover Weekly').",
             "If user says 'play Spotify' with no specific content, use action='play' with no query (resumes last playback).",
             "If user says 'pause', 'stop', or 'stop the music', use action='pause'.",
             "If user says 'next', 'next song', or 'skip', use action='skip'.",
@@ -448,6 +492,14 @@ class SpotifyCommand(IJarvisCommand):
                 expected_parameters={"action": "play", "query": "Discover Weekly"},
             ),
             CommandExample(
+                voice_command="Play my running playlist",
+                expected_parameters={"action": "play", "query": "running"},
+            ),
+            CommandExample(
+                voice_command="Play favorite songs 2026",
+                expected_parameters={"action": "play", "query": "favorite songs 2026"},
+            ),
+            CommandExample(
                 voice_command="Pause Spotify",
                 expected_parameters={"action": "pause"},
             ),
@@ -479,6 +531,13 @@ class SpotifyCommand(IJarvisCommand):
             ("Play my Discover Weekly", {"action": "play", "query": "Discover Weekly"}),
             ("Play the Today's Top Hits playlist", {"action": "play", "query": "Today's Top Hits"}),
             ("Play my chill playlist", {"action": "play", "query": "chill"}),
+            ("Play my running playlist", {"action": "play", "query": "running"}),
+            ("Play my workout playlist", {"action": "play", "query": "workout"}),
+            ("Play the 80s playlist", {"action": "play", "query": "80s"}),
+            ("Play favorite songs 2026", {"action": "play", "query": "favorite songs 2026"}),
+            ("Play my road trip playlist on Spotify", {"action": "play", "query": "road trip"}),
+            ("Put on my morning playlist", {"action": "play", "query": "morning"}),
+            ("Play my liked songs", {"action": "play", "query": "liked songs"}),
             ("Play Bohemian Rhapsody", {"action": "play", "query": "Bohemian Rhapsody"}),
             ("Play the Dark Side of the Moon album", {"action": "play", "query": "Dark Side of the Moon"}),
             ("Play Spotify", {"action": "play"}),
@@ -666,8 +725,12 @@ class SpotifyCommand(IJarvisCommand):
                 context_data={"error": "not_authenticated"},
             )
 
+        if action == "play":
+            # `play` needs the raw voice phrase to detect playlist intent
+            # ("play my X playlist", "play my X"); the other handlers don't.
+            return self._handle_play(request_info, **kwargs)
+
         handler_map: dict[str, Any] = {
-            "play": self._handle_play,
             "pause": self._handle_pause,
             "skip": self._handle_skip,
             "previous": self._handle_previous,
@@ -686,11 +749,14 @@ class SpotifyCommand(IJarvisCommand):
 
     # -- Handlers ------------------------------------------------------------
 
-    def _handle_play(self, **kwargs: Any) -> CommandResponse:
+    def _handle_play(
+        self, request_info: RequestInformation, **kwargs: Any,
+    ) -> CommandResponse:
         from spotify_shared import go_librespot_manager
         from spotify_shared.go_librespot_manager import GoLibrespotMissingError
         from spotify_shared.local_client import LocalAPIError, LocalAPIUnavailable
         query: str | None = kwargs.get("query")
+        voice_command: str = request_info.voice_command if request_info else ""
 
         try:
             self._ensure_daemon_running()
@@ -738,15 +804,46 @@ class SpotifyCommand(IJarvisCommand):
                 context_data={"action": "play", "message": "Resumed Spotify"},
             )
 
-        # Play-with-query path: resolve via Web API search, then play the
-        # returned URI through the local daemon.
-        search_result, err = self._call_with_refresh(lambda c: c.search(query))
+        # Resolve a URI to play. Route by playlist intent inferred from the
+        # raw voice phrase ("playlist" / "my X") so user playlists beat
+        # coincidental catalog matches when the user explicitly asked for
+        # one of their own playlists.
+        intent: str
+        cleaned_query: str
+        intent, cleaned_query = _detect_playlist_intent(voice_command, query)
+
+        hit: Any = None
+        err: str | None = None
+
+        if intent == "strong":
+            hit, err = self._call_with_refresh(
+                lambda c: c.find_user_playlist(cleaned_query, allow_substring=True),
+            )
+            if not err and hit is None:
+                return CommandResponse.error_response(
+                    error_details=(
+                        f"I couldn't find a playlist matching '{cleaned_query}' "
+                        f"in your Spotify library."
+                    ),
+                    context_data={"error": "no_playlist_match", "query": cleaned_query},
+                )
+        elif intent == "soft":
+            hit, err = self._call_with_refresh(
+                lambda c: c.find_user_playlist(cleaned_query, allow_substring=True),
+            )
+            if not err and hit is None:
+                # No playlist for "play my X" — fall through to catalog search
+                # with the original phrase so e.g. "play my Beatles" still
+                # finds the artist.
+                hit, err = self._call_with_refresh(lambda c: c.search(query))
+        else:
+            hit, err = self._call_with_refresh(lambda c: c.search(query))
+
         if err:
             return CommandResponse.error_response(
                 error_details=f"Spotify search failed: {err}",
                 context_data={"error": "search_failed", "query": query},
             )
-        hit = search_result
         if hit is None:
             return CommandResponse.error_response(
                 error_details=f"I couldn't find anything on Spotify for '{query}'.",

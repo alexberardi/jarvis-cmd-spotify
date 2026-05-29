@@ -15,6 +15,8 @@ node, playback automatically routes to it (via PulseAudio's `PULSE_SINK`).
 |--------|--------|
 | "Play Radiohead on Spotify" | Searches and plays the artist Radiohead |
 | "Play my Discover Weekly playlist" | Plays the playlist |
+| "Play my running playlist" | Finds a user playlist named "Running" (substring match allowed when phrasing is explicit) |
+| "Play favorite songs 2026" | Multi-word query that exactly matches a user playlist wins over coincidental catalog matches |
 | "Pause" / "Stop the music" | Pauses playback |
 | "Skip" / "Next song" | Next track |
 | "Previous" / "Go back" | Previous track |
