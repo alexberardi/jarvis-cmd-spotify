@@ -44,6 +44,23 @@ except ImportError:
 logger = JarvisLogger(service="cmd.spotify.web")
 
 
+# Module-level httpx.Client singleton — reused across all Web API calls.
+# Per-call httpx.request() was creating a new Client + connection pool on
+# every search/playlist call, accumulating memory across the long-running
+# keepalive-agent + per-voice-command paths. One pooled client is the
+# canonical pattern.
+_client: "httpx.Client | None" = None
+
+
+def _get_client() -> "httpx.Client":
+    global _client
+    if _client is None:
+        if httpx is None:
+            raise RuntimeError("httpx not available")
+        _client = httpx.Client(timeout=10.0)
+    return _client
+
+
 API_BASE: str = "https://api.spotify.com/v1"
 
 
@@ -101,7 +118,7 @@ class SpotifyClient:
 
         for attempt in range(1, self._MAX_ATTEMPTS + 1):
             try:
-                resp = httpx.request(  # type: ignore[union-attr]
+                resp = _get_client().request(
                     method, url,
                     headers=self._headers(),
                     params=params,

@@ -42,6 +42,24 @@ except ImportError:
 logger = JarvisLogger(service="cmd.spotify.local")
 
 
+# Module-level httpx.Client singleton — reused across every localhost call.
+# Per-call httpx.request() was creating a new Client + connection pool each
+# time, so heavy command usage (play/pause/next, etc.) compounded with the
+# keepalive ticks built up unreleased state. One pooled client is the
+# canonical pattern.
+_client: "httpx.Client | None" = None
+
+
+def _get_client() -> "httpx.Client":
+    global _client
+    if _client is None:
+        if httpx is None:
+            raise RuntimeError("httpx not available")
+        # Per-call timeout overrides this default when supplied.
+        _client = httpx.Client(timeout=5.0)
+    return _client
+
+
 class LocalAPIError(RuntimeError):
     """Non-2xx response from the go-librespot local API."""
 
@@ -93,7 +111,7 @@ class LocalClient:
     ) -> Any:
         url: str = f"{self._base}{path}"
         try:
-            resp = httpx.request(  # type: ignore[union-attr]
+            resp = _get_client().request(
                 method, url, json=json_body,
                 timeout=timeout if timeout is not None else self._FAST_TIMEOUT_SECONDS,
             )

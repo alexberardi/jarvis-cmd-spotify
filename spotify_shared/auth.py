@@ -42,6 +42,24 @@ logger = JarvisLogger(service="cmd.spotify.auth")
 TOKEN_URL: str = "https://accounts.spotify.com/api/token"
 
 
+# Module-level httpx.Client singleton — reused across token refresh calls.
+# Each httpx.post() at module-level created a new Client with its own
+# connection pool that wasn't released cleanly, accumulating ~5-25 MB per
+# few minutes on the long-running keepalive-agent loop. Reusing one Client
+# (lazy-init below) pools connections and lets GC reclaim response objects
+# normally.
+_client: "httpx.Client | None" = None
+
+
+def _get_client() -> "httpx.Client":
+    global _client
+    if _client is None:
+        if httpx is None:
+            raise RuntimeError("httpx not available")
+        _client = httpx.Client(timeout=15.0)
+    return _client
+
+
 def refresh_access_token(*, client_id: str, refresh_token: str) -> dict[str, Any] | None:
     """Exchange a refresh_token for a new access_token.
 
@@ -59,11 +77,10 @@ def refresh_access_token(*, client_id: str, refresh_token: str) -> dict[str, Any
         "client_id": client_id,
     }
     try:
-        resp = httpx.post(
+        resp = _get_client().post(
             TOKEN_URL,
             content=urlencode(body),
             headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=15.0,
         )
     except Exception as e:
         logger.error("Spotify token refresh network error", error=str(e))
