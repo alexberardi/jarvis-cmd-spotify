@@ -240,6 +240,14 @@ def _write_config(device_name: str) -> None:
 
     ``volume_steps: 100`` makes the HTTP API's ``volume`` field a direct
     0-100 percent — no mapping math in the local client.
+
+    ``credentials.zeroconf.persist_credentials: true`` flips on so that
+    the first zeroconf pairing from a Spotify client writes a usable
+    credentials blob into ``state.json``; on subsequent daemon starts
+    go-librespot reads that and auto-reconnects without the user having
+    to re-select "Jarvis" in their phone's Spotify app every reboot.
+    Default in go-librespot 0.7.2 is ``false``, which is why empty stub
+    state.json files have been the steady state on existing nodes.
     """
     cfg_dir: Path = _go_librespot_config_dir()
     cfg_dir.mkdir(parents=True, exist_ok=True)
@@ -255,6 +263,8 @@ def _write_config(device_name: str) -> None:
         "log_level: info\n"
         "credentials:\n"
         "  type: zeroconf\n"
+        "  zeroconf:\n"
+        "    persist_credentials: true\n"
         "server:\n"
         "  enabled: true\n"
         f"  address: {API_HOST}\n"
