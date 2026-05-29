@@ -144,11 +144,39 @@ def _clear_pid() -> None:
 
 
 def _process_alive(pid: int) -> bool:
+    """True if a go-librespot process exists at ``pid``.
+
+    The binary-name check guards against PID-reuse staleness: after a
+    reboot the pidfile may still name a PID that's now in use by an
+    unrelated process — empirically often a Python thread of the
+    jarvis-node service itself, since both come up under the same UID
+    early in boot. A bare ``os.kill(pid, 0)`` would incorrectly report
+    the daemon as running and the keepalive would never spawn it.
+    """
     try:
         os.kill(pid, 0)
-        return True
     except (ProcessLookupError, PermissionError):
         return False
+    return _pid_is_go_librespot(pid)
+
+
+def _pid_is_go_librespot(pid: int) -> bool:
+    comm_path = Path(f"/proc/{pid}/comm")
+    if comm_path.exists():
+        try:
+            return comm_path.read_text().strip() == "go-librespot"
+        except OSError:
+            return False
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if result.returncode != 0:
+        return False
+    return Path(result.stdout.strip()).name == "go-librespot"
 
 
 @dataclass
