@@ -14,6 +14,8 @@ and retry once.
 
 from __future__ import annotations
 
+import difflib
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -70,6 +72,101 @@ class SpotifyAuthError(RuntimeError):
 
 class SpotifyAPIError(RuntimeError):
     """Generic API error (non-2xx, non-401)."""
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Plain edit-distance — short Python loop, no extra dependency."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev: list[int] = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        curr: list[int] = [i]
+        for j, cb in enumerate(b, 1):
+            cost: int = 0 if ca == cb else 1
+            curr.append(min(curr[-1] + 1, prev[j] + 1, prev[j - 1] + cost))
+        prev = curr
+    return prev[-1]
+
+
+def _token_close_enough(a: str, b: str) -> bool:
+    """Are two single-word tokens close enough to count as the same word?
+
+    Short tokens (≤ 4 chars) need exact match — otherwise common words like
+    "play" / "pay" or "day" / "bay" become indistinguishable. Longer tokens
+    allow 1 edit (5-7 chars) or 2 edits (8+) so STT slips (Night/Knight,
+    Bangers/Bangerz) and minor alt-spellings still match.
+    """
+    if a == b:
+        return True
+    if len(a) <= 4 or len(b) <= 4:
+        return False
+    max_dist: int = 1 if max(len(a), len(b)) <= 7 else 2
+    if abs(len(a) - len(b)) > max_dist:
+        return False
+    return _levenshtein(a, b) <= max_dist
+
+
+_TOKEN_SPLIT_RE: re.Pattern[str] = re.compile(r"[^\w']+")
+
+
+def _fuzzy_match_playlist(
+    query: str, playlists: list[dict[str, str]],
+) -> "SearchHit | None":
+    """Best fuzzy match across all playlists, or None.
+
+    Every query token must match some token in the playlist name (exact or
+    close via `_token_close_enough`). The winning playlist maximises mean
+    per-token similarity, with a small length penalty so a tight 2-of-2
+    match beats a 2-of-5 sprawl.
+    """
+    q_tokens: list[str] = [t for t in _TOKEN_SPLIT_RE.split(query.lower()) if t]
+    if not q_tokens:
+        return None
+
+    best_score: float = 0.0
+    best: dict[str, str] | None = None
+
+    for p in playlists:
+        n_tokens: list[str] = [t for t in _TOKEN_SPLIT_RE.split(p["name"].lower()) if t]
+        if not n_tokens:
+            continue
+
+        matched: int = 0
+        sim_sum: float = 0.0
+        for qt in q_tokens:
+            best_pair: float = 0.0
+            for nt in n_tokens:
+                if not _token_close_enough(qt, nt):
+                    continue
+                pair: float = (
+                    1.0 if qt == nt
+                    else difflib.SequenceMatcher(None, qt, nt).ratio()
+                )
+                if pair > best_pair:
+                    best_pair = pair
+            if best_pair > 0.0:
+                matched += 1
+                sim_sum += best_pair
+
+        if matched < len(q_tokens):
+            continue
+
+        avg: float = sim_sum / len(q_tokens)
+        # Penalise playlists that bury the match in extra tokens — prefer
+        # tight matches. 0.05 per extra token is enough to break ties but
+        # not enough to drop a strong match.
+        score: float = avg - 0.05 * max(0, len(n_tokens) - len(q_tokens))
+        if score > best_score:
+            best_score = score
+            best = p
+
+    if best is None:
+        return None
+    return SearchHit(uri=best["uri"], kind="playlist", display=best["name"])
 
 
 @dataclass
@@ -260,6 +357,11 @@ class SpotifyClient:
             for p in playlists:
                 if q in p["name"].lower():
                     return SearchHit(uri=p["uri"], kind="playlist", display=p["name"])
+
+            # Last resort: fuzzy match on tokens. Catches STT homophones
+            # ("Knight" vs "Night") and alt-spellings ("Bangers" vs
+            # "Bangerz") that exact/prefix/substring all miss.
+            return _fuzzy_match_playlist(query, playlists)
 
         return None
 

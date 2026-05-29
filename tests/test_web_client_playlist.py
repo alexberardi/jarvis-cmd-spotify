@@ -91,6 +91,86 @@ def test_substring_only_when_no_exact_or_prefix(client: SpotifyClient) -> None:
     assert hit.uri == "spotify:playlist:exact"
 
 
+# ── fuzzy matching (homophones, alt spellings, STT slips) ─────────────────
+
+
+def test_fuzzy_handles_stt_homophone(client: SpotifyClient) -> None:
+    """STT often turns 'Night' into 'Knight' — fuzzy must bridge that."""
+    playlists = [
+        {"name": "Jungle Night", "uri": "spotify:playlist:jn", "id": "jn"},
+    ]
+    with patch.object(client, "list_user_playlists", return_value=playlists):
+        hit = client.find_user_playlist("jungle knight", allow_substring=True)
+    assert hit is not None
+    assert hit.uri == "spotify:playlist:jn"
+
+
+def test_fuzzy_handles_z_for_s_spelling(client: SpotifyClient) -> None:
+    """User says 'bangers', playlist named 'Bangerz' (or vice versa)."""
+    playlists = [
+        {"name": "Running Bangerz", "uri": "spotify:playlist:rb", "id": "rb"},
+    ]
+    with patch.object(client, "list_user_playlists", return_value=playlists):
+        hit = client.find_user_playlist("running bangers", allow_substring=True)
+    assert hit is not None
+    assert hit.uri == "spotify:playlist:rb"
+
+
+def test_fuzzy_handles_token_in_longer_name(client: SpotifyClient) -> None:
+    """Fuzzy single-token match inside a multi-word playlist name."""
+    playlists = [
+        {"name": "Jungle Night Vibes", "uri": "spotify:playlist:jnv", "id": "jnv"},
+    ]
+    with patch.object(client, "list_user_playlists", return_value=playlists):
+        hit = client.find_user_playlist("jungle knight", allow_substring=True)
+    assert hit is not None
+    assert hit.uri == "spotify:playlist:jnv"
+
+
+def test_fuzzy_off_by_default(client: SpotifyClient) -> None:
+    """Without explicit intent we don't fuzzy match — too loose for unprompted searches."""
+    playlists = [
+        {"name": "Jungle Night", "uri": "spotify:playlist:jn", "id": "jn"},
+    ]
+    with patch.object(client, "list_user_playlists", return_value=playlists):
+        hit = client.find_user_playlist("jungle knight")
+    assert hit is None
+
+
+def test_fuzzy_rejects_obvious_mismatch(client: SpotifyClient) -> None:
+    """Fuzzy must not return spurious matches when there's no real overlap."""
+    playlists = [
+        {"name": "Classical Concertos", "uri": "spotify:playlist:cc", "id": "cc"},
+    ]
+    with patch.object(client, "list_user_playlists", return_value=playlists):
+        hit = client.find_user_playlist("jungle knight", allow_substring=True)
+    assert hit is None
+
+
+def test_fuzzy_picks_best_match_among_options(client: SpotifyClient) -> None:
+    """When several playlists fuzzy-match, pick the closest one."""
+    playlists = [
+        {"name": "Jungle Mix", "uri": "spotify:playlist:jm", "id": "jm"},
+        {"name": "Jungle Night Sessions", "uri": "spotify:playlist:jns", "id": "jns"},
+    ]
+    with patch.object(client, "list_user_playlists", return_value=playlists):
+        hit = client.find_user_playlist("jungle knight", allow_substring=True)
+    assert hit is not None
+    # "Jungle Night Sessions" shares both query tokens (jungle + night~knight)
+    # while "Jungle Mix" only shares one.
+    assert hit.uri == "spotify:playlist:jns"
+
+
+def test_fuzzy_respects_short_word_threshold(client: SpotifyClient) -> None:
+    """Short words (≤4 chars) require exact match — otherwise 'play' would fuzzy to 'pay', etc."""
+    playlists = [
+        {"name": "Pay Day", "uri": "spotify:playlist:pd", "id": "pd"},
+    ]
+    with patch.object(client, "list_user_playlists", return_value=playlists):
+        hit = client.find_user_playlist("play day", allow_substring=True)
+    assert hit is None
+
+
 def test_empty_query_returns_none(client: SpotifyClient) -> None:
     hit = client.find_user_playlist("")
     assert hit is None
