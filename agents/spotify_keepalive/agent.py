@@ -98,7 +98,7 @@ class SpotifyKeepaliveAgent(IJarvisAgent):
             JarvisSecret(
                 "SPOTIFY_DEVICE_NAME",
                 "Name shown for this node in your Spotify app's Devices list (default: Jarvis)",
-                "node", "string",
+                "integration", "string",
                 is_sensitive=False, required=False,
                 friendly_name="Device Name",
             ),

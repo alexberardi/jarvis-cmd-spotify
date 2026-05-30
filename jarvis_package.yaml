@@ -53,6 +53,13 @@ secrets:
     Jarvis)'
   is_sensitive: false
   friendly_name: Device Name
+- key: SPOTIFY_USER_ID
+  scope: integration
+  value_type: string
+  required: false
+  description: Spotify user ID (fetched automatically after first auth)
+  is_sensitive: false
+  friendly_name: Spotify User ID
 packages:
 - name: httpx
 display_name: Spotify
