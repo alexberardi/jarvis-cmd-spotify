@@ -71,6 +71,102 @@ from jarvis_command_sdk import (
 logger = JarvisLogger(service="cmd.spotify")
 
 
+_SETUP_GUIDE: str = """## What you need (about 5 minutes)
+
+- A **free Spotify Developer account** — uses your regular Spotify login. No review process, no payment.
+- **Spotify Premium** — Spotify's playback control APIs are Premium-only. Free accounts can search but can't play.
+
+> Why a Developer app? Spotify policy doesn't allow shared client IDs across users, so every Jarvis household has to register its own. The whole setup takes about two minutes.
+
+## Step 1 — Create your Spotify Developer app
+
+1. Open **[developer.spotify.com/dashboard](https://developer.spotify.com/dashboard)** and sign in with your Spotify account.
+2. Click the green **Create app** button.
+3. Fill in the form:
+   - **App name** — anything you like (e.g. `Jarvis`).
+   - **App description** — anything (e.g. `Personal voice assistant`).
+   - **Website** — leave blank.
+   - **Redirect URI** — paste this **exactly** and click the **Add** button so it appears in the list below the field:
+     ```
+     https://relay.jarvisautomation.io/oauth/bounce
+     ```
+     This is the Jarvis OAuth bounce endpoint. It catches Spotify's response and forwards the token back to your phone so you never have to host anything yourself.
+   - **Which API/SDKs are you planning to use?** — tick **Web API**. You can leave the others unchecked.
+   - Accept Spotify's developer terms.
+4. Click **Save**.
+
+## Step 2 — Copy your Client ID into Jarvis
+
+1. On your new app's page, click **Settings** (top-right).
+2. Look for **Client ID** — it's the long string near the top. You do **not** need the Client Secret.
+3. Tap the copy icon next to Client ID.
+4. Back in Jarvis, tap **Spotify Client ID** above and paste it in.
+
+## Step 3 — Sign in to Spotify from Jarvis
+
+1. Tap **Authenticate with Spotify** at the bottom of this screen.
+2. Sign in with your Spotify account (the Premium one).
+3. Approve the requested permissions.
+4. You'll briefly bounce through `relay.jarvisautomation.io` — that's the same URL you registered in Step 1, and it's how the access token gets back to your phone.
+5. The window closes and the **Access Token** / **Refresh Token** fields above fill in automatically. Tokens refresh in the background indefinitely — you only do this once.
+
+## Step 4 — Pair the node with your Spotify account (one-time)
+
+The first time you ask for music, the node fires up a small local Spotify Connect daemon called `go-librespot`. It auto-downloads — no manual install — but Spotify requires you to pair it from the official app once:
+
+1. Say *"Hey Jarvis, play some music on Spotify"*. Jarvis will tell you the device isn't paired yet — that's expected the first time.
+2. Open the **Spotify app on your phone**.
+3. Tap the **Devices icon** (the speaker icon in the bottom-left of the now-playing bar).
+4. Under **Other devices**, you'll see **Jarvis** (or whatever you set in **Device Name** below).
+5. Tap it. Music starts on the node and the pairing is remembered.
+
+You only do this once per node. After that, voice playback works without ever opening the Spotify app.
+
+## How playback works
+
+- **Search and metadata** → Spotify Web API
+- **Play / pause / skip / volume / shuffle / repeat** → the local `go-librespot` daemon at `localhost:3678`
+
+Earlier versions of this command drove playback through Spotify's Web API (`PUT /me/player/play` etc.). That path constantly 5xx'd because Spotify's Connect API is unreliable for non-first-party devices. Routing playback through the local daemon eliminates the entire class of "couldn't transfer playback" errors.
+
+## Optional — change the device name
+
+By default the node advertises itself as **Jarvis** in your Spotify Devices list. To change it, set **Device Name** below and restart the node. If you'd already paired the old name, you'll need to pair the new one once from the Spotify app.
+
+## Troubleshooting
+
+### "Spotify isn't authenticated yet" when you try to play
+
+Tap **Authenticate with Spotify** above. If the OAuth page errors out (`INVALID_CLIENT: Invalid redirect URI`), the redirect URI in your Spotify dashboard doesn't match. It must be exactly:
+```
+https://relay.jarvisautomation.io/oauth/bounce
+```
+No trailing slash, no `http://`, no extra characters.
+
+### "Open Spotify on your phone... and select Jarvis"
+
+That's the one-time pairing in Step 4. Open the Spotify app, hit the Devices icon, and pick **Jarvis** from the list.
+
+### "Premium required" or nothing plays
+
+Spotify's playback control APIs are Premium-only. Free accounts can search the catalog but can't control playback. There is no workaround — this is enforced by Spotify.
+
+### You revoked Jarvis from your Spotify account and now playback fails
+
+Tap **Authenticate with Spotify** again to issue a fresh token.
+
+### Voice command finds the wrong thing
+
+Try the exact official title. The speech transcription may have heard the name slightly differently than Spotify spells it. For your **own** playlists, say *"play my [playlist name] playlist"* — that routes to your library before checking the catalog.
+
+### The node isn't showing up in the Spotify Devices list
+
+- The daemon only starts on the first play request — say *"play some music on Spotify"* first to wake it up.
+- Make sure your phone and the Jarvis node are on the same WiFi network.
+- If still nothing, restart the node and try again.
+"""
+
+
 _REPEAT_MAP: dict[str, str] = {
     "off": "off",
     "no": "off",
@@ -206,6 +302,10 @@ class SpotifyCommand(IJarvisCommand):
     @property
     def associated_service(self) -> str:
         return "Spotify"
+
+    @property
+    def setup_guide(self) -> str | None:
+        return _SETUP_GUIDE
 
     # -- Parameters ----------------------------------------------------------
 
