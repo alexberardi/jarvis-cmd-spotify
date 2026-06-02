@@ -207,6 +207,38 @@ def ensure_running_unpaused() -> None:
         pass
 
 
+def is_active() -> bool:
+    """True if go-librespot is producing audio (uncorked PulseAudio sink-input).
+
+    Ambiguous voice phrases like "stop"/"pause"/"skip" should only route to
+    Spotify when Spotify is the audible player — otherwise they'd hijack
+    commands meant for a different music service (Pandora, etc.). The daemon
+    stays running as a Connect advertiser even when idle, so "process exists"
+    is useless; instead, ask PulseAudio whether it's actively pulling samples
+    from a ``go-librespot`` process.
+    """
+    try:
+        result = subprocess.run(
+            ["pactl", "-f", "json", "list", "sink-inputs"],
+            capture_output=True, text=True, timeout=2.0,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    if result.returncode != 0:
+        return False
+    try:
+        items = json.loads(result.stdout or "[]")
+    except (ValueError, TypeError):
+        return False
+    for item in items:
+        props = item.get("properties") or {}
+        if props.get("application.process.binary") == "go-librespot":
+            if item.get("corked"):
+                continue
+            return True
+    return False
+
+
 def stop() -> None:
     """Terminate the go-librespot subprocess, if running."""
     pid: int | None = _read_pid()

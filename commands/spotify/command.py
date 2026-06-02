@@ -232,41 +232,6 @@ def _detect_playlist_intent(voice_command: str, query: str) -> tuple[str, str]:
     return ("strong" if has_playlist_word else "soft"), cleaned
 
 
-def _spotify_is_active() -> bool:
-    """True if go-librespot is producing audio (uncorked PulseAudio sink-input).
-
-    Ambiguous voice phrases like "stop"/"pause"/"skip" should only route to
-    Spotify when Spotify is the audible player — otherwise they'd hijack
-    commands meant for a different music service (Pandora, etc.). The daemon
-    stays running as a Connect advertiser even when idle, so "process exists"
-    is useless; instead, ask PulseAudio whether it's actively pulling samples
-    from a ``go-librespot`` process.
-    """
-    import json as _json
-    import subprocess
-
-    try:
-        result = subprocess.run(
-            ["pactl", "-f", "json", "list", "sink-inputs"],
-            capture_output=True, text=True, timeout=2.0,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False
-    if result.returncode != 0:
-        return False
-    try:
-        items = _json.loads(result.stdout or "[]")
-    except (ValueError, TypeError):
-        return False
-    for item in items:
-        props = item.get("properties") or {}
-        if props.get("application.process.binary") == "go-librespot":
-            if item.get("corked"):
-                continue
-            return True
-    return False
-
-
 class SpotifyCommand(IJarvisCommand):
     """Stream Spotify on this node — search, play, pause, skip, volume, shuffle, repeat."""
 
@@ -527,7 +492,8 @@ class SpotifyCommand(IJarvisCommand):
             "resume": {"action": "play"},
         }
         if text in ambiguous_map:
-            if _spotify_is_active():
+            from spotify_shared import go_librespot_manager
+            if go_librespot_manager.is_active():
                 return PreRouteResult(arguments=ambiguous_map[text])
             return None
 
