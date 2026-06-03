@@ -858,16 +858,20 @@ class SpotifyCommand(IJarvisCommand):
             )
 
         # Resume path: no query → just resume whatever was last playing.
+        # Defer the actual local.resume() until on_response_complete so it
+        # fires AFTER the wake duck has released — otherwise the first
+        # seconds of audio go into the duck null sink and the user hears
+        # music start mid-track.
         if not query:
-            try:
-                local.resume()
-            except (LocalAPIError, LocalAPIUnavailable) as e:
-                return CommandResponse.error_response(
-                    error_details=f"Couldn't resume Spotify: {e}",
-                    context_data={"error": "resume_failed"},
-                )
+            def _do_resume() -> None:
+                try:
+                    local.resume()
+                except (LocalAPIError, LocalAPIUnavailable) as e:
+                    logger.error("Deferred Spotify resume failed", error=str(e))
+
             return CommandResponse.success_response(
                 context_data={"action": "play", "message": "Resumed Spotify"},
+                on_response_complete=_do_resume,
             )
 
         # Resolve a URI to play. Route by playlist intent inferred from the
@@ -916,13 +920,20 @@ class SpotifyCommand(IJarvisCommand):
                 context_data={"error": "no_results", "query": query},
             )
 
-        try:
-            local.play(uri=hit.uri)
-        except (LocalAPIError, LocalAPIUnavailable) as e:
-            return CommandResponse.error_response(
-                error_details=f"Spotify play failed: {e}",
-                context_data={"error": "play_failed"},
-            )
+        # Defer the actual local.play(uri=...) until on_response_complete
+        # fires AFTER TTS + duck release — otherwise the first ~3-5s of
+        # the track stream into the duck null sink and the user hears the
+        # song begin mid-track. The HTTP API has already been pre-warmed
+        # by _wait_for_ready earlier in this handler, so failures here are
+        # rare; if one does occur, we log it (user notices no music and
+        # asks again).
+        uri = hit.uri
+
+        def _do_play() -> None:
+            try:
+                local.play(uri=uri)
+            except (LocalAPIError, LocalAPIUnavailable) as e:
+                logger.error("Deferred Spotify play failed", error=str(e), uri=uri)
 
         kind_label: str = {
             "track": "track", "album": "album",
@@ -932,6 +943,7 @@ class SpotifyCommand(IJarvisCommand):
 
         return CommandResponse.success_response(
             context_data={"action": "play", "message": message},
+            on_response_complete=_do_play,
         )
 
     def _handle_pause(self, **_kwargs: Any) -> CommandResponse:
