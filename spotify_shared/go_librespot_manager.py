@@ -232,7 +232,11 @@ def is_active() -> bool:
         return False
     for item in items:
         props = item.get("properties") or {}
-        if props.get("application.process.binary") == "go-librespot":
+        # PA reports the absolute path on Linux (we install go-librespot to
+        # ~/.jarvis/spotify/bin/go-librespot), not the bare binary name —
+        # match on basename so this works regardless of install location.
+        binary = props.get("application.process.binary") or ""
+        if os.path.basename(binary) == "go-librespot":
             if item.get("corked"):
                 continue
             return True
