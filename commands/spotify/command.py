@@ -798,6 +798,7 @@ class SpotifyCommand(IJarvisCommand):
 
         handler_map: dict[str, Any] = {
             "pause": self._handle_pause,
+            "stop": self._handle_pause,
             "skip": self._handle_skip,
             "previous": self._handle_previous,
             "volume": self._handle_volume,
