@@ -431,6 +431,7 @@ class SpotifyCommand(IJarvisCommand):
     def rules(self) -> list[str]:
         return [
             "If user says 'play [X] on Spotify' or 'play [X]' (after Spotify context), use action='play' with query='[X]'.",
+            "If user says 'play [song] by [artist]', keep the whole phrase: use action='play' with query='[song] by [artist]' — do NOT drop the 'by [artist]' part.",
             "If user says 'play my [X] playlist' or 'play the [X] playlist', use action='play' with query='[X]' (drop 'my'/'the' and 'playlist' — just the name).",
             "If user says 'play my [X]' without 'playlist', use action='play' with query='[X]' (drop 'my' — covers user playlists like 'play my Discover Weekly').",
             "If user says 'play Spotify' with no specific content, use action='play' with no query (resumes last playback).",

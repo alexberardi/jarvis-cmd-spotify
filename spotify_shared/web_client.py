@@ -181,6 +181,28 @@ class SearchHit:
     display: str
 
 
+# Split on the LAST " by " so titles that themselves contain "by"
+# (e.g. "Stand By Me by Ben E. King") resolve to song="Stand By Me",
+# artist="Ben E. King" rather than over-splitting on the first "by".
+_SONG_BY_ARTIST_RE = re.compile(r"\s+by\s+", re.IGNORECASE)
+
+
+def _split_song_by_artist(query: str) -> tuple[str, str]:
+    """Split a ``"{song} by {artist}"`` phrase into ``(song, artist)``.
+
+    Returns ``("", "")`` when there's no " by " qualifier, so a plain
+    "play X" keeps its normal artist-first resolution.
+    """
+    parts = _SONG_BY_ARTIST_RE.split(query.strip())
+    if len(parts) < 2:
+        return "", ""
+    artist = parts[-1].strip()
+    song = " by ".join(parts[:-1]).strip()
+    if not song or not artist:
+        return "", ""
+    return song, artist
+
+
 class SpotifyClient:
     def __init__(self, access_token: str) -> None:
         if httpx is None:
@@ -367,10 +389,46 @@ class SpotifyClient:
 
     # -- Catalog search --
 
+    def _search_track_by_artist(
+        self, song: str, artist: str, *, limit: int = 5,
+    ) -> SearchHit | None:
+        """Resolve a specific track via Spotify ``track:``/``artist:`` filters.
+
+        Used for "{song} by {artist}" phrasing. The general ``search()``
+        ranks artist hits first, so without this "play X by Y" plays
+        artist Y's top track instead of the song X. Returns the top
+        matching track, or ``None`` when nothing matched (the caller then
+        falls back to normal resolution).
+        """
+        data = self._request(
+            "GET", "/search",
+            params={
+                "q": f"track:{song} artist:{artist}",
+                "type": "track",
+                "limit": limit,
+            },
+        )
+        if not isinstance(data, dict):
+            return None
+        tracks = (data.get("tracks") or {}).get("items") or []
+        if not tracks:
+            return None
+        top = tracks[0]
+        artist_name: str = ""
+        top_artists = top.get("artists") or []
+        if top_artists:
+            artist_name = top_artists[0].get("name", "")
+        label: str = top.get("name", "track")
+        if artist_name:
+            label = f"{label} by {artist_name}"
+        return SearchHit(uri=top["uri"], kind="track", display=label)
+
     def search(self, query: str, *, limit: int = 5) -> SearchHit | None:
         """Search the Spotify catalog and return the best hit.
 
         Resolution order:
+          0. "{song} by {artist}" phrasing: targeted track search, so
+             "play X by Y" plays the song X — not artist Y's top track.
           1. For multi-word queries (≥ 2 tokens): user's own playlist by
              exact → prefix → fuzzy match. Voice queries like "play feel
              good acoustic" are almost always the user naming their own
@@ -388,6 +446,19 @@ class SpotifyClient:
         were noisy and rarely what the user wanted.
         """
         q_low: str = query.lower().strip()
+
+        # Step 0: "{song} by {artist}" → targeted track search. The catalog
+        # search below ranks artist hits first, so "play X by Y" would
+        # otherwise play artist Y's top track instead of the song X. Only
+        # reached for non-playlist intent (see _handle_play), so "by" here
+        # is overwhelmingly song-by-artist; fall through on a miss.
+        song, artist = _split_song_by_artist(query)
+        if song and artist:
+            track_hit: SearchHit | None = self._search_track_by_artist(
+                song, artist, limit=limit,
+            )
+            if track_hit is not None:
+                return track_hit
 
         # Step 1: multi-word playlist promotion (exact / prefix / fuzzy).
         if len(q_low.split()) >= 2:
