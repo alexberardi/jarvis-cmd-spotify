@@ -282,6 +282,7 @@ class SpotifyCommand(IJarvisCommand):
                 enum_values=[
                     "play",
                     "pause",
+                    "stop",
                     "skip",
                     "previous",
                     "volume",
@@ -289,7 +290,11 @@ class SpotifyCommand(IJarvisCommand):
                     "repeat",
                     "now_playing",
                 ],
-                description="The Spotify control action to perform",
+                description=(
+                    "The Spotify control action to perform. "
+                    "'stop' is accepted and behaves the same as 'pause' "
+                    "(go-librespot pauses rather than disconnects)."
+                ),
             ),
             JarvisParameter(
                 "query", "string", required=False,
