@@ -82,6 +82,14 @@ voice ──► command.py ─────────────────�
 | `spotify_shared/auth.py` | OAuth refresh-token exchange |
 | `agents/spotify_keepalive/agent.py` | Keeps the daemon alive + refreshes OAuth tokens proactively |
 
+### Now playing on the display and in the app
+
+`SpotifyCommand` is an `IJarvisMusicCommand` (SDK 0.16+). The node reads what
+go-librespot is playing (`GET /status`) and shows it on a touch display, with
+cover art from Spotify's image CDN (`i.scdn.co`); its transport controls and
+the built-in "pause the music" commands go to the same local daemon. On an
+older SDK the package loads as a plain command and nothing is reported.
+
 ### Why two clients?
 
 Every previous version of this package drove playback through Spotify's
