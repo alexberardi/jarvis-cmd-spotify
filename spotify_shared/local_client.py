@@ -84,6 +84,9 @@ class LocalStatus:
     track_name: str
     track_artists: list[str]
     track_album: str
+    position_ms: int = 0
+    duration_ms: int = 0
+    album_cover_url: str = ""
 
 
 class LocalClient:
@@ -165,6 +168,9 @@ class LocalClient:
             track_name=str(track.get("name") or ""),
             track_artists=[str(a) for a in (track.get("artist_names") or [])],
             track_album=str(track.get("album_name") or ""),
+            position_ms=int(track.get("position") or 0),
+            duration_ms=int(track.get("duration") or 0),
+            album_cover_url=str(track.get("album_cover_url") or ""),
         )
 
     # -- Playback ----------------------------------------------------------
@@ -206,6 +212,9 @@ class LocalClient:
             "POST", "/player/prev",
             timeout=self._SLOW_TIMEOUT_SECONDS,
         )
+
+    def seek(self, position_ms: int) -> None:
+        self._request("POST", "/player/seek", json_body={"position": max(0, int(position_ms))})
 
     # -- Volume ------------------------------------------------------------
 

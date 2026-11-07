@@ -67,6 +67,11 @@ from jarvis_command_sdk import (
     RequestInformation,
 )
 
+try:
+    from jarvis_command_sdk import IJarvisMusicCommand, PlaybackArtwork, PlaybackState
+except ImportError:  # SDK < 0.16: a plain command; nothing asks it for playback
+    IJarvisMusicCommand = IJarvisCommand  # type: ignore[misc,assignment]
+
 
 logger = JarvisLogger(service="cmd.spotify")
 
@@ -237,11 +242,97 @@ def _detect_playlist_intent(voice_command: str, query: str) -> tuple[str, str]:
     return ("strong" if has_playlist_word else "soft"), cleaned
 
 
-class SpotifyCommand(IJarvisCommand):
+# repeat: the SDK's modes ↔ go-librespot's two booleans. Each press moves to the next mode.
+_REPEAT_NEXT: dict[str, str] = {"off": "all", "all": "one", "one": "off"}
+_REPEAT_TO_LOCAL: dict[str, str] = {"off": "off", "all": "context", "one": "track"}
+
+# Covers come from Spotify's image CDN (go-librespot's album_cover_url); nothing else is fetched.
+_COVER_HOST_SUFFIX: str = ".scdn.co"
+_COVER_TIMEOUT_SECONDS: float = 5.0
+
+
+class SpotifyCommand(IJarvisMusicCommand):
     """Stream Spotify on this node — search, play, pause, skip, volume, shuffle, repeat."""
 
     def __init__(self) -> None:
         self._storage = JarvisStorage("spotify")
+        self._cover: tuple[str, Any] | None = None  # (url, PlaybackArtwork): the current track's
+
+    # -- Playback (IJarvisMusicCommand) ---------------------------------------
+    # The node's display, the mobile app and the built-in "pause the music" commands read and
+    # control go-librespot through these. Every state is read from the daemon, never assumed.
+
+    @property
+    def playback_binary(self) -> str:
+        return "go-librespot"
+
+    def playback_status(self) -> Any:
+        # A plain client: polling must not start the daemon or SIGCONT it.
+        from spotify_shared import go_librespot_manager
+        from spotify_shared.local_client import LocalAPIUnavailable, LocalClient
+
+        try:
+            st = LocalClient(base_url=go_librespot_manager.api_url()).status()
+        except LocalAPIUnavailable:
+            return None  # daemon not running: nothing plays
+        if st.stopped or not st.track_uri:
+            return None
+        repeat = "one" if st.repeat_track else "all" if st.repeat_context else "off"
+        return PlaybackState(
+            state="paused" if st.paused else "playing",
+            media_title=st.track_name,
+            media_artist=", ".join(st.track_artists),
+            media_album=st.track_album,
+            position=st.position_ms / 1000,
+            duration=st.duration_ms / 1000 if st.duration_ms else None,
+            volume=round(st.volume * 100 / st.volume_steps) if st.volume_steps else None,
+            actions=("play", "pause", "next", "previous", "seek", "volume", "shuffle", "repeat"),
+            shuffle=st.shuffle_context,
+            repeat=repeat,
+        )
+
+    def playback_control(self, action: str, **args: Any) -> Any:
+        local = self._make_local_client()
+        if action == "play":
+            local.resume()
+        elif action == "pause":
+            local.pause()
+        elif action == "next":
+            local.next()
+        elif action == "previous":
+            local.prev()
+        elif action == "seek":
+            local.seek(round(float(args["position"]) * 1000))
+        elif action == "volume":
+            local.set_volume(int(args["volume"]))
+        elif action == "shuffle":
+            local.set_shuffle(not local.status().shuffle_context)
+        elif action == "repeat":
+            st = local.status()
+            now = "one" if st.repeat_track else "all" if st.repeat_context else "off"
+            local.set_repeat(_REPEAT_TO_LOCAL[_REPEAT_NEXT[now]])
+        else:
+            raise ValueError(f"spotify does not support {action!r}")
+        return self.playback_status()
+
+    def playback_artwork(self) -> Any:
+        from urllib.parse import urlsplit
+
+        import httpx
+        from spotify_shared import go_librespot_manager
+        from spotify_shared.local_client import LocalClient
+
+        url = LocalClient(base_url=go_librespot_manager.api_url()).status().album_cover_url
+        parts = urlsplit(url)
+        if parts.scheme != "https" or not (parts.hostname or "").endswith(_COVER_HOST_SUFFIX):
+            return None
+        if self._cover and self._cover[0] == url:
+            return self._cover[1]
+        resp = httpx.get(url, timeout=_COVER_TIMEOUT_SECONDS)
+        resp.raise_for_status()
+        art = PlaybackArtwork(data=resp.content, mime=resp.headers.get("content-type", "").split(";")[0].strip())
+        self._cover = (url, art)
+        return art
 
     # -- Metadata ------------------------------------------------------------
 
