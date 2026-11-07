@@ -71,7 +71,13 @@ from jarvis_command_sdk import (
 logger = JarvisLogger(service="cmd.spotify")
 
 
-_SETUP_GUIDE: str = """## What you need (about 5 minutes)
+_SETUP_GUIDE: str = """## Use it as a speaker (no setup)
+
+Installed as it is, this package makes the node a **Spotify Connect speaker**. Open the Spotify app on a phone on the same Wi-Fi, tap the **Devices** icon and pick **Jarvis** (or the **Device Name** you set below). Music plays on the node, and you control it from the Spotify app. You need **Spotify Premium**; nothing else.
+
+With no setup, Jarvis can still pause, skip, go back, change the volume, shuffle, repeat and say what's playing. To ask Jarvis to play something by name ("play Radiohead"), do the steps below once.
+
+## Voice search (about 5 minutes)
 
 - A **free Spotify Developer account** — uses your regular Spotify login. No review process, no payment.
 - **Spotify Premium** — Spotify's playback control APIs are Premium-only. Free accounts can search but can't play.
@@ -112,13 +118,12 @@ _SETUP_GUIDE: str = """## What you need (about 5 minutes)
 
 ## Step 4 — Pair the node with your Spotify account (one-time)
 
-The first time you ask for music, the node fires up a small local Spotify Connect daemon called `go-librespot`. It auto-downloads — no manual install — but Spotify requires you to pair it from the official app once:
+The node runs a small local Spotify Connect daemon called `go-librespot`, started with the node. It auto-downloads — no manual install — but Spotify requires you to pair it from the official app once. If you already picked the node as a speaker in the Spotify app, it's paired and you can skip this step.
 
-1. Say *"Hey Jarvis, play some music on Spotify"*. Jarvis will tell you the device isn't paired yet — that's expected the first time.
-2. Open the **Spotify app on your phone**.
-3. Tap the **Devices icon** (the speaker icon in the bottom-left of the now-playing bar).
-4. Under **Other devices**, you'll see **Jarvis** (or whatever you set in **Device Name** below).
-5. Tap it. Music starts on the node and the pairing is remembered.
+1. Open the **Spotify app on your phone**.
+2. Tap the **Devices icon** (the speaker icon in the bottom-left of the now-playing bar).
+3. Under **Other devices**, you'll see **Jarvis** (or whatever you set in **Device Name** below).
+4. Tap it. Music starts on the node and the pairing is remembered.
 
 You only do this once per node. After that, voice playback works without ever opening the Spotify app.
 
@@ -135,9 +140,9 @@ By default the node advertises itself as **Jarvis** in your Spotify Devices list
 
 ## Troubleshooting
 
-### "Spotify isn't authenticated yet" when you try to play
+### "To play something by name..." when you ask for music
 
-Tap **Authenticate with Spotify** above. If the OAuth page errors out (`INVALID_CLIENT: Invalid redirect URI`), the redirect URI in your Spotify dashboard doesn't match. It must be exactly:
+Playing by name needs the voice search setup above. If you've done it, tap **Authenticate with Spotify** again. If the OAuth page errors out (`INVALID_CLIENT: Invalid redirect URI`), the redirect URI in your Spotify dashboard doesn't match. It must be exactly:
 ```
 https://relay.jarvisautomation.io/oauth/bounce
 ```
@@ -161,7 +166,7 @@ Try the exact official title. The speech transcription may have heard the name s
 
 ### The node isn't showing up in the Spotify Devices list
 
-- The daemon only starts on the first play request — say *"play some music on Spotify"* first to wake it up.
+- The daemon starts with the node and is checked every five minutes; give a freshly started node a few minutes.
 - Make sure your phone and the Jarvis node are on the same WiFi network.
 - If still nothing, restart the node and try again.
 """
@@ -327,9 +332,10 @@ class SpotifyCommand(IJarvisCommand):
         return [
             JarvisSecret(
                 "SPOTIFY_CLIENT_ID",
-                "Spotify Developer App Client ID — create one at developer.spotify.com",
+                "Spotify Developer App Client ID, only for asking Jarvis to play something by name "
+                "(without it the node is still a Spotify Connect speaker) — create one at developer.spotify.com",
                 "integration", "string",
-                is_sensitive=False, required=True,
+                is_sensitive=False, required=False,
                 friendly_name="Spotify Client ID",
             ),
             JarvisSecret(
@@ -788,15 +794,8 @@ class SpotifyCommand(IJarvisCommand):
                 context_data={"error": "missing_action"},
             )
 
-        if not self._access_token() and not self._refresh_token():
-            return CommandResponse.error_response(
-                error_details=(
-                    "Spotify isn't authenticated yet. Open Jarvis settings and "
-                    "tap 'Authenticate with Spotify'."
-                ),
-                context_data={"error": "not_authenticated"},
-            )
-
+        # Only playing by name uses the Web API; every other action is the local daemon, so a node
+        # with no Spotify sign-in is still a speaker that voice can pause and skip.
         if action == "play":
             # `play` needs the raw voice phrase to detect playlist intent
             # ("play my X playlist", "play my X"); the other handlers don't.
@@ -885,6 +884,16 @@ class SpotifyCommand(IJarvisCommand):
         # raw voice phrase ("playlist" / "my X") so user playlists beat
         # coincidental catalog matches when the user explicitly asked for
         # one of their own playlists.
+        if not self._access_token() and not self._refresh_token():
+            return CommandResponse.error_response(
+                error_details=(
+                    "To play something by name, open the Spotify package's settings in Jarvis, "
+                    "add your Spotify Client ID and tap 'Authenticate with Spotify'. Until then, "
+                    "pick this speaker in the Spotify app."
+                ),
+                context_data={"error": "not_authenticated"},
+            )
+
         intent: str
         cleaned_query: str
         intent, cleaned_query = _detect_playlist_intent(voice_command, query)

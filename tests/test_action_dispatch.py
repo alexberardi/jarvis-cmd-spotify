@@ -70,3 +70,40 @@ def test_unknown_action_still_errors(cmd: SpotifyCommand) -> None:
     result = cmd.run(MagicMock(), action="dance")
 
     assert result.context_data.get("error") == "unknown_action"
+
+
+def test_local_actions_work_without_spotify_sign_in(cmd: SpotifyCommand) -> None:
+    """A node with no Client ID is a speaker; pause, skip and the rest use the local daemon."""
+    cmd._access_token = MagicMock(return_value=None)  # type: ignore[method-assign]
+    cmd._refresh_token = MagicMock(return_value=None)  # type: ignore[method-assign]
+    cmd._handle_pause = MagicMock(return_value="PAUSED")  # type: ignore[method-assign]
+
+    assert cmd.run(MagicMock(), action="pause") == "PAUSED"
+
+
+def test_play_by_name_without_sign_in_explains_setup(cmd: SpotifyCommand) -> None:
+    cmd._access_token = MagicMock(return_value=None)  # type: ignore[method-assign]
+    cmd._refresh_token = MagicMock(return_value=None)  # type: ignore[method-assign]
+    cmd._ensure_daemon_running = MagicMock()  # type: ignore[method-assign]
+    cmd._make_local_client = MagicMock()  # type: ignore[method-assign]
+    cmd._wait_for_ready = MagicMock(return_value=True)  # type: ignore[method-assign]
+    request = MagicMock(voice_command="play radiohead on spotify")
+
+    result = cmd.run(request, action="play", query="radiohead")
+
+    assert result.success is False
+    assert result.context_data["error"] == "not_authenticated"
+    assert "Client ID" in result.error_details
+
+
+def test_resume_without_sign_in_uses_the_daemon(cmd: SpotifyCommand) -> None:
+    cmd._access_token = MagicMock(return_value=None)  # type: ignore[method-assign]
+    cmd._refresh_token = MagicMock(return_value=None)  # type: ignore[method-assign]
+    cmd._ensure_daemon_running = MagicMock()  # type: ignore[method-assign]
+    cmd._make_local_client = MagicMock()  # type: ignore[method-assign]
+    cmd._wait_for_ready = MagicMock(return_value=True)  # type: ignore[method-assign]
+
+    result = cmd.run(MagicMock(voice_command="play spotify"), action="play")
+
+    assert result.success is True
+    assert result.context_data["action"] == "play"
