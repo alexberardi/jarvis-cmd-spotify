@@ -27,10 +27,18 @@ node, playback automatically routes to it (via PulseAudio's `PULSE_SINK`).
 
 ## Setup
 
+**As a speaker, nothing to set up.** Install the package and the node shows
+up as a Spotify Connect speaker: open Spotify on your phone, tap the Devices
+icon and select **Jarvis** (or whatever you set in `SPOTIFY_DEVICE_NAME`).
+Voice can pause, skip, change the volume, shuffle, repeat and say what's
+playing. You need Spotify Premium.
+
+**To ask Jarvis to play something by name**, add a Client ID once:
+
 1. **Spotify Premium account** — playback APIs require Premium.
 2. **Create a Spotify Developer App** at
    [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard)
-   - Redirect URI: `com.jarvis.app://oauthredirect`
+   - Redirect URI: `https://relay.jarvisautomation.io/oauth/bounce`
    - Tick "Web API"
 3. **Paste the Client ID** in the package's settings on the Jarvis mobile app
    (`SPOTIFY_CLIENT_ID`) and tap "Authenticate with Spotify".
